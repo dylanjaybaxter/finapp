@@ -1,0 +1,89 @@
+{
+  "name": "chase_activity_v1",
+  "description": "Chase transactional activity export with Transaction/Post Date columns.",
+  "match": {
+    "filename_patterns": ["Chase1337_Activity"],
+    "header_contains": [
+      "Transaction Date",
+      "Post Date",
+      "Description",
+      "Category",
+      "Type",
+      "Amount"
+    ]
+  },
+  "requirements": {
+    "required_normalized_fields": [
+      "Transaction Date",
+      "Description",
+      "Amount"
+    ]
+  },
+  "fields": {
+    "column_mappings": {
+      "Transaction Date": ["Transaction Date"],
+      "Post Date": ["Post Date"],
+      "Description": ["Description"],
+      "Category": ["Category"],
+      "Type": ["Type"],
+      "Amount": ["Amount"],
+      "Memo": ["Memo"],
+      "Currency": ["Currency"],
+      "Transaction Reference": ["Transaction Reference"],
+      "FI Transaction Reference": ["FI Transaction Reference"],
+      "Original Amount": ["Original Amount"]
+    },
+    "category_mappings": {
+      "Type": {
+        "SALE": "Expense",
+        "PAYMENT": "Expense",
+        "TRANSFER": "Transfer",
+        "ACH_DEBIT": "Expense",
+        "DEBIT": "Expense",
+        "ACH_CREDIT": "Income",
+        "DEPOSIT": "Income",
+        "CREDIT": "Income",
+        "FEE": "Fee"
+      }
+    },
+    "category_groups": {
+      "Category": {
+        "Dining": ["FOOD & DRINK", "FOOD AND DRINK", "DINING"],
+        "Groceries": ["GROCERIES", "SUPERMARKETS"],
+        "Transportation": ["GAS", "TRANSPORTATION", "AUTO & TRANSPORT"],
+        "Utilities": ["BILLS & UTILITIES", "UTILITIES", "INTERNET", "TELEVISION", "PHONE"],
+        "Travel": ["TRAVEL", "AIRFARE", "HOTELS", "CAR RENTAL"],
+        "Housing": ["HOME", "MORTGAGE", "RENT"],
+        "Health": ["HEALTH & WELLNESS", "MEDICAL", "PHARMACY"],
+        "Entertainment": ["ENTERTAINMENT", "MOVIES", "STREAMING SERVICES"],
+        "Shopping": ["SHOPPING", "RETAIL"],
+        "Fees": ["FEES", "FEE"],
+        "Income": ["INCOME", "PAYROLL", "SALARY", "BONUS", "DIVIDENDS"],
+        "Transfers": ["TRANSFER", "ACH", "TRANSFERRED"],
+        "Other": ["OTHER", "UNCATEGORIZED"]
+      }
+    },
+    "description_keywords": {
+      "Dining": ["CAFE", "COFFEE", "RESTAURANT", "TACO", "PIZZA", "BURGER", "GRILL", "BAR ", "DINER", "BISTRO"],
+      "Groceries": ["GROCERY", "SUPERMARKET", "MARKET", "SAFEWAY", "TRADER JOE", "WHOLE FOODS", "RALPHS"],
+      "Transportation": ["UBER", "LYFT", "TAXI", "SHELL", "EXXON", "CHEVRON", "GAS STATION", "METRO", "PARKING"],
+      "Utilities": ["COMCAST", "PG&E", "AT&T", "VERIZON", "T-MOBILE", "UTILITY", "ELECTRIC", "WATER BILL"],
+      "Travel": ["AIRLINES", "AIRWAYS", "MARRIOTT", "HILTON", "HOTEL", "AIRBNB", "CAR RENTAL", "TRAVELODGE"],
+      "Housing": ["RENT", "MORTGAGE", "APARTMENT", "PROPERTY MGMT", "LANDLORD"],
+      "Health": ["PHARMACY", "CVS", "WALGREENS", "DENTAL", "MEDICAL", "HOSPITAL", "OPTICAL"],
+      "Entertainment": ["NETFLIX", "SPOTIFY", "HULU", "AMC", "THEATER", "GAMING", "BOWLING"],
+      "Shopping": ["AMAZON", "TARGET", "WALMART", "BEST BUY", "APPLE STORE", "CLOTHING", "SHOP", "AMAZON PAY"],
+      "Fees": ["FEE", "SERVICE CHARGE", "MAINTENANCE", "OVERDRAFT"],
+      "Income": ["PAYROLL", "SALARY", "PAYMENT", "DEPOSIT", "TRANSFER CREDIT", "VENMO CASHOUT"],
+      "Transfers": ["TRANSFER", "PAYPAL", "XFER"],
+      "Other": ["MISC", "UNCATEGORIZED", "ZELLE", "VENMO", "ADJUSTMENT"]
+    }
+  },
+  "transformations": {
+    "Memo": {
+      "type": "append_fields",
+      "fields": ["Category"],
+      "separator": " | "
+    }
+  }
+}

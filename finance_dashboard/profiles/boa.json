@@ -1,0 +1,91 @@
+{
+  "name": "boa_statement_v1",
+  "description": "Bank of America statement export with CREDIT/DEBIT indicator.",
+  "match": {
+    "filename_patterns": ["transactions_", "statements_"],
+    "header_contains": [
+      "POSTED DATE",
+      "DESCRIPTION",
+      "AMOUNT",
+      "CREDIT/DEBIT"
+    ]
+  },
+  "requirements": {
+    "required_normalized_fields": [
+      "Transaction Date",
+      "Description",
+      "Amount"
+    ]
+  },
+  "fields": {
+    "column_mappings": {
+      "Transaction Date": ["POSTED DATE"],
+      "Post Date": ["POSTED DATE"],
+      "Description": ["DESCRIPTION"],
+      "Amount": ["AMOUNT"],
+      "Currency": ["CURRENCY"],
+      "Transaction Reference": ["TRANSACTION REFERENCE NUMBER"],
+      "FI Transaction Reference": ["FI TRANSACTION REFERENCE"],
+      "Type": ["TYPE"],
+      "Flow Direction": ["CREDIT/DEBIT"],
+      "Original Amount": ["ORIGINAL AMOUNT"]
+    },
+    "category_mappings": {
+      "Flow Direction": {
+        "DEBIT": "Expense",
+        "CREDIT": "Income"
+      },
+      "Type": {
+        "DDA DEBIT": "Expense",
+        "DDA WITHDRAWAL": "Expense",
+        "DDA DEPOSIT": "Income",
+        "DDA CREDIT": "Income"
+      }
+    },
+    "category_groups": {
+      "Type": {
+        "Dining": ["DINING", "RESTAURANT"],
+        "Groceries": ["GROCERY", "GROCERIES"],
+        "Transportation": ["TOLL", "RIDESHARE", "FUEL"],
+        "Utilities": ["UTILITY", "UTILITIES", "ELECTRIC", "GAS BILL"],
+        "Travel": ["TRAVEL", "AIRFARE", "HOTEL"],
+        "Housing": ["MORTGAGE", "RENT"],
+        "Health": ["HEALTH", "MEDICAL", "PHARMACY"],
+        "Entertainment": ["ENTERTAINMENT", "MOVIE"],
+        "Shopping": ["POS", "CARD PURCHASE", "RETAIL"],
+        "Fees": ["FEE", "SERVICE CHARGE", "DDA FEE"],
+        "Income": ["DDA DEPOSIT", "DDA CREDIT", "ACH CREDIT", "DIRECTDEP"],
+        "Transfers": ["TRANSFER", "ACH"],
+        "Other": ["DDA DEBIT", "DDA WITHDRAWAL", "CHECK", "ATM", "OTHER", "UNCATEGORIZED"]
+      }
+    },
+    "description_keywords": {
+      "Dining": ["CAFE", "COFFEE", "TACO", "PIZZA", "BURGER", "GRILL", "RESTAURANT", "BAR ", "DINER"],
+      "Groceries": ["GROCERY", "SAFEWAY", "WHOLE FOODS", "TRADER JOE", "MARKET"],
+      "Transportation": ["UBER", "LYFT", "TAXI", "SHELL", "EXXON", "CHEVRON", "PARKING", "METRO"],
+      "Utilities": ["COMCAST", "PG&E", "AT&T", "VERIZON", "T-MOBILE", "UTILITY"],
+      "Travel": ["AIRLINE", "AIRWAYS", "MARRIOTT", "HILTON", "HOTEL", "AIRBNB", "CAR RENTAL"],
+      "Housing": ["RENT", "MORTGAGE", "APARTMENT", "PROPERTY MGMT"],
+      "Health": ["PHARMACY", "CVS", "WALGREENS", "CLINIC", "MEDICAL", "HOSPITAL"],
+      "Entertainment": ["NETFLIX", "SPOTIFY", "HULU", "DISNEY", "THEATER", "GAMING"],
+      "Shopping": ["AMAZON", "TARGET", "WALMART", "BEST BUY", "APPLE", "SHOP"],
+      "Fees": ["FEE", "SERVICE CHARGE", "MAINTENANCE"],
+      "Income": ["PAYROLL", "SALARY", "DEPOSIT"],
+      "Transfers": ["TRANSFER", "PAYPAL", "XFER"],
+      "Other": ["MISC", "UNCATEGORIZED", "ZELLE", "VENMO", "ADJUSTMENT"]
+    }
+  },
+  "transformations": {
+    "Amount": {
+      "type": "indicator_sign",
+      "indicator_field": "Flow Direction",
+      "credit_values": ["CREDIT"],
+      "debit_values": ["DEBIT"]
+    },
+    "Memo": {
+      "type": "append_fields",
+      "fields": ["TYPE"],
+      "separator": " | "
+    }
+  }
+}

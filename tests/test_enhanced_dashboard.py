@@ -9,9 +9,11 @@ import sys
 import os
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Add the project root to the Python path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 from finance_dashboard.personal_finance_analytics import PersonalFinanceAnalytics
 
@@ -21,9 +23,9 @@ def test_enhanced_dashboard():
     print("🧪 Testing Enhanced Personal Finance Dashboard...")
     
     # Load sample data
-    sample_data_path = "sample_data/Chase1337_Activity20230913_20250913_20250914.CSV"
+    sample_data_path = project_root / "sample_data" / "Chase1337_Activity20230913_20250913_20250914.CSV"
     
-    if not os.path.exists(sample_data_path):
+    if not sample_data_path.exists():
         print("❌ Sample data not found. Please ensure the sample CSV file exists.")
         return False
     
@@ -87,7 +89,7 @@ def test_enhanced_dashboard():
         
         print("\n🎉 All tests passed! The Enhanced Personal Finance Dashboard is working correctly.")
         print("\nTo run the dashboard:")
-        print("1. Run: bash scripts/run_enhanced_dashboard.sh")
+        print("1. Run: make run (or bash scripts/run_enhanced_dashboard_module.sh)")
         print("2. Open: http://localhost:8501")
         print("3. Upload your bank statement or use the sample data")
         
@@ -103,6 +105,4 @@ def test_enhanced_dashboard():
 if __name__ == "__main__":
     success = test_enhanced_dashboard()
     sys.exit(0 if success else 1)
-
-
 

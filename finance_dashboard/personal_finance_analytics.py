@@ -9,11 +9,21 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import warnings
 
 warnings.filterwarnings('ignore')
+
+TRANSFER_CATEGORY_LABELS = {'transfer', 'transfers', 'internal transfer'}
+TRANSFER_TYPE_LABELS = {'transfer'}
+HOUSING_CATEGORY_LABELS = {
+    'rent', 'rent/mortgage', 'housing', 'mortgage', 'housing & rent', 'rent expense'
+}
+HOUSING_KEYWORDS = {
+    'apartment', 'apartments', 'apt', 'enclave', 'rent', 'lease', 'mortgage'
+}
+HOUSING_KEYWORD_PATTERN = '|'.join(sorted(HOUSING_KEYWORDS))
 
 
 class PersonalFinanceAnalytics:
@@ -33,7 +43,41 @@ class PersonalFinanceAnalytics:
             self.data['Post Date'] = pd.to_datetime(self.data['Post Date'])
         
         # Ensure Amount is numeric
-        self.data['Amount'] = pd.to_numeric(self.data['Amount'], errors='coerce')
+        self.data['Amount'] = pd.to_numeric(self.data['Amount'], errors='coerce').fillna(0.0)
+
+        # Normalize category/type text so downstream filters behave consistently
+        self.data['Category'] = (
+            self.data.get('Category', 'Uncategorized')
+            .fillna('Uncategorized')
+            .astype(str)
+        )
+        type_series = self.data.get('Type')
+        if isinstance(type_series, pd.Series):
+            self.data['Type'] = type_series.fillna('').astype(str)
+        else:
+            self.data['Type'] = ''
+
+        lowered_category = self.data['Category'].str.strip().str.lower()
+        lowered_type = self.data['Type'].str.strip().str.lower()
+        desc_series = self.data.get('Description')
+        if isinstance(desc_series, pd.Series):
+            description_lower = desc_series.fillna('').astype(str).str.lower()
+        else:
+            description_lower = pd.Series('', index=self.data.index)
+
+        is_transfer = lowered_category.isin(TRANSFER_CATEGORY_LABELS)
+        uncategorized_mask = lowered_category.isin({'', 'uncategorized', 'none'})
+        is_transfer |= uncategorized_mask & lowered_type.isin(TRANSFER_TYPE_LABELS)
+
+        housing_like = lowered_category.isin(HOUSING_CATEGORY_LABELS)
+        if HOUSING_KEYWORD_PATTERN:
+            housing_like |= description_lower.str.contains(HOUSING_KEYWORD_PATTERN, na=False)
+        is_transfer = np.where(housing_like, False, is_transfer)
+        is_income = (self.data['Amount'] > 0) & ~is_transfer
+
+        self.data['Flow Category'] = 'Expense'
+        self.data.loc[is_income, 'Flow Category'] = 'Income'
+        self.data.loc[is_transfer, 'Flow Category'] = 'Transfer'
         
         # Create additional time-based columns
         if 'Transaction Date' in self.data.columns:
@@ -42,6 +86,26 @@ class PersonalFinanceAnalytics:
             self.data['Day'] = self.data['Transaction Date'].dt.day
             self.data['Weekday'] = self.data['Transaction Date'].dt.day_name()
             self.data['Month_Name'] = self.data['Transaction Date'].dt.month_name()
+
+    def _expense_rows(self, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        source = df if df is not None else self.data
+        if 'Flow Category' not in source.columns:
+            tmp = source.copy()
+            tmp['Flow Category'] = np.where(tmp.get('Amount', 0) >= 0, 'Income', 'Expense')
+            source = tmp
+        expenses = source[source['Flow Category'] == 'Expense'].copy()
+        if expenses.empty:
+            return expenses
+        mask = ~expenses['Category'].str.lower().isin({'income', 'transfer', 'transfers'})
+        return expenses[mask]
+
+    def _income_rows(self, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        source = df if df is not None else self.data
+        if 'Flow Category' not in source.columns:
+            tmp = source.copy()
+            tmp['Flow Category'] = np.where(tmp.get('Amount', 0) >= 0, 'Income', 'Expense')
+            source = tmp
+        return source[source['Flow Category'] == 'Income'].copy()
     
     def calculate_monthly_summary(self, year: int = None, month: int = None) -> Dict[str, float]:
         """Calculate monthly financial summary."""
@@ -55,8 +119,8 @@ class PersonalFinanceAnalytics:
             (self.data['Month'] == month)
         ]
         
-        income = monthly_data[monthly_data['Amount'] > 0]['Amount'].sum()
-        expenses = abs(monthly_data[monthly_data['Amount'] < 0]['Amount'].sum())
+        income = self._income_rows(monthly_data)['Amount'].sum()
+        expenses = abs(self._expense_rows(monthly_data)['Amount'].sum())
         net_flow = income - expenses
         savings_rate = (net_flow / income * 100) if income > 0 else 0
         
@@ -71,16 +135,22 @@ class PersonalFinanceAnalytics:
     def calculate_period_summary(self, start_date: str = None, end_date: str = None) -> Dict:
         """Calculate financial summary for a specific time period."""
         filtered_data = self._filter_by_date_range(start_date, end_date)
-        
-        income = filtered_data[filtered_data['Amount'] > 0]['Amount'].sum()
-        expenses = abs(filtered_data[filtered_data['Amount'] < 0]['Amount'].sum())
+
+        income = self._income_rows(filtered_data)['Amount'].sum()
+        expense_rows = self._expense_rows(filtered_data)
+        expense_rows = expense_rows[~expense_rows['Category'].str.lower().isin({'income', 'transfer', 'transfers'})]
+        expenses = abs(expense_rows['Amount'].sum())
         net_flow = income - expenses
         savings_rate = (net_flow / income * 100) if income > 0 else 0
-        
-        # Calculate largest transactions
-        largest_expenses = filtered_data[filtered_data['Amount'] < 0].nlargest(10, 'Amount', keep='all')
-        largest_expenses['Amount'] = largest_expenses['Amount'].abs()
-        
+
+        # Calculate largest transactions (true expenses only)
+        largest_expenses = expense_rows[
+            ~expense_rows['Category'].str.lower().isin(HOUSING_CATEGORY_LABELS)
+        ].copy()
+        if not largest_expenses.empty:
+            largest_expenses['Amount'] = largest_expenses['Amount'].abs()
+            largest_expenses = largest_expenses.sort_values('Amount', ascending=False).head(10)
+
         return {
             'income': income,
             'expenses': expenses,
@@ -149,10 +219,16 @@ class PersonalFinanceAnalytics:
         return category_data
     
     def calculate_category_spending(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-        """Calculate spending by category for a date range."""
+        """Calculate spending by category for a date range.
+        
+        Excludes Income and Transfers from spending calculations.
+        """
         filtered_data = self._filter_by_date_range(start_date, end_date)
-        expenses = filtered_data[filtered_data['Amount'] < 0].copy()
+        expenses = self._expense_rows(filtered_data)
         expenses['Amount'] = expenses['Amount'].abs()
+        
+        if expenses.empty:
+            return pd.DataFrame(columns=['Total_Spent', 'Transaction_Count', 'Avg_Transaction', 'First_Transaction', 'Last_Transaction'])
         
         category_spending = expenses.groupby('Category').agg({
             'Amount': ['sum', 'count', 'mean'],
@@ -165,13 +241,15 @@ class PersonalFinanceAnalytics:
         return category_spending
     
     def calculate_spending_trends(self, category: str = None, period: str = 'monthly') -> pd.DataFrame:
-        """Calculate spending trends over time."""
-        data = self.data.copy()
+        """Calculate spending trends over time.
         
+        Excludes Income and Transfers from spending calculations.
+        """
+        data = self.data.copy()
         if category:
             data = data[data['Category'] == category]
         
-        expenses = data[data['Amount'] < 0].copy()
+        expenses = self._expense_rows(data)
         expenses['Amount'] = expenses['Amount'].abs()
         
         if period == 'monthly':
@@ -187,7 +265,10 @@ class PersonalFinanceAnalytics:
         return trends
     
     def calculate_budget_performance(self, budgets: Dict[str, float], year: int = None, month: int = None) -> pd.DataFrame:
-        """Calculate budget performance vs actual spending."""
+        """Calculate budget performance vs actual spending.
+        
+        Excludes Income and Transfers from spending calculations.
+        """
         if year is None:
             year = datetime.now().year
         if month is None:
@@ -198,14 +279,26 @@ class PersonalFinanceAnalytics:
             (self.data['Month'] == month)
         ]
         
+        monthly_data = self._expense_rows(monthly_data)
+        
         budget_performance = []
         
+        # Categories to exclude from budget performance calculations
+        exclude_categories = {'income', 'transfer', 'transfers'}
+        
         for category, budget_amount in budgets.items():
-            actual_spending = abs(monthly_data[monthly_data['Category'] == category]['Amount'].sum())
+            # Skip if category is Income or Transfer (case-insensitive)
+            if category.lower() in exclude_categories:
+                continue
+                
+            category_mask = monthly_data['Category'] == category
+            actual_spending = abs(
+                monthly_data.loc[category_mask & (monthly_data['Amount'] < 0), 'Amount'].sum()
+            )
             remaining = budget_amount - actual_spending
             percentage_used = (actual_spending / budget_amount * 100) if budget_amount > 0 else 0
             status = 'Over Budget' if actual_spending > budget_amount else 'Under Budget'
-            
+
             budget_performance.append({
                 'Category': category,
                 'Budget': budget_amount,
@@ -227,32 +320,54 @@ class PersonalFinanceAnalytics:
             (self.data['Transaction Date'] >= start_date) & 
             (self.data['Transaction Date'] <= end_date)
         ]
-        
+
+        if recent_data.empty:
+            recent_data = self.data.copy()
+
+        if recent_data.empty:
+            return {
+                'total_income_12m': 0.0,
+                'total_expenses_12m': 0.0,
+                'net_worth_change_12m': 0.0,
+                'monthly_income_avg': 0.0,
+                'monthly_expenses_avg': 0.0,
+                'monthly_savings_avg': 0.0,
+                'savings_rate': 0.0,
+                'top_expense_category': 'N/A',
+                'top_expense_amount': 0.0,
+                'spending_consistency': 0.0
+            }
+
         # Calculate metrics
-        total_income = recent_data[recent_data['Amount'] > 0]['Amount'].sum()
-        total_expenses = abs(recent_data[recent_data['Amount'] < 0]['Amount'].sum())
+        total_income = self._income_rows(recent_data)['Amount'].sum()
+        total_expenses = abs(self._expense_rows(recent_data)['Amount'].sum())
         net_worth_change = total_income - total_expenses
-        
+
         # Monthly averages
-        monthly_income = total_income / 12
-        monthly_expenses = total_expenses / 12
+        month_count = recent_data['Transaction Date'].dt.to_period('M').nunique()
+        month_count = max(month_count, 1)
+        monthly_income = total_income / month_count
+        monthly_expenses = total_expenses / month_count
         monthly_savings = monthly_income - monthly_expenses
-        
+
         # Savings rate
         savings_rate = (monthly_savings / monthly_income * 100) if monthly_income > 0 else 0
-        
-        # Expense categories analysis
-        category_expenses = recent_data[recent_data['Amount'] < 0].groupby('Category')['Amount'].sum().abs()
+
+        # Expense categories analysis (exclude Income and Transfers)
+        expense_data = self._expense_rows(recent_data)
+        category_expenses = expense_data.groupby('Category')['Amount'].sum().abs()
         top_expense_category = category_expenses.idxmax() if len(category_expenses) > 0 else 'N/A'
         top_expense_amount = category_expenses.max() if len(category_expenses) > 0 else 0
         
         # Spending consistency (coefficient of variation)
-        monthly_spending = recent_data[recent_data['Amount'] < 0].groupby(
+        monthly_spending = self._expense_rows(recent_data).groupby(
             recent_data['Transaction Date'].dt.to_period('M')
         )['Amount'].sum().abs()
-        
-        spending_consistency = (monthly_spending.std() / monthly_spending.mean() * 100) if len(monthly_spending) > 1 else 0
-        
+
+        spending_consistency = 0.0
+        if len(monthly_spending) > 1 and monthly_spending.mean() != 0:
+            spending_consistency = (monthly_spending.std() / monthly_spending.mean()) * 100
+
         return {
             'total_income_12m': total_income,
             'total_expenses_12m': total_expenses,
@@ -268,28 +383,33 @@ class PersonalFinanceAnalytics:
     
     def calculate_spending_patterns(self) -> Dict[str, Any]:
         """Analyze spending patterns and behaviors."""
-        expenses = self.data[self.data['Amount'] < 0].copy()
+        expenses = self._expense_rows()
         expenses['Amount'] = expenses['Amount'].abs()
         
         # Day of week patterns
         weekday_spending = expenses.groupby('Weekday')['Amount'].sum().reindex([
             'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
-        ])
-        
+        ]).fillna(0.0)
+
         # Monthly patterns
         monthly_spending = expenses.groupby('Month_Name')['Amount'].sum().reindex([
             'January', 'February', 'March', 'April', 'May', 'June',
             'July', 'August', 'September', 'October', 'November', 'December'
-        ])
-        
+        ]).fillna(0.0)
+
         # Time of day patterns (if we had time data)
         # For now, we'll use transaction count as proxy
-        daily_transactions = expenses.groupby(expenses['Transaction Date'].dt.date).size()
-        
         # Spending frequency
-        avg_daily_spending = expenses.groupby(expenses['Transaction Date'].dt.date)['Amount'].sum().mean()
-        spending_frequency = len(daily_transactions) / 30  # transactions per day
-        
+        avg_daily_spending_series = expenses.groupby(expenses['Transaction Date'].dt.date)['Amount'].sum()
+        avg_daily_spending = avg_daily_spending_series.mean()
+        if pd.isna(avg_daily_spending):
+            avg_daily_spending = 0.0
+        days_span = 0
+        if not expenses.empty:
+            days_span = (expenses['Transaction Date'].max() - expenses['Transaction Date'].min()).days + 1
+        days_span = max(days_span, 1)
+        spending_frequency = len(expenses) / days_span
+
         # Large transaction analysis
         large_transactions = expenses[expenses['Amount'] > expenses['Amount'].quantile(0.95)]
         
@@ -305,7 +425,15 @@ class PersonalFinanceAnalytics:
     def calculate_goal_progress(self, goals: List[Dict]) -> List[Dict]:
         """Calculate progress towards financial goals."""
         goal_progress = []
-        
+
+        latest_summary = None
+        if 'Transaction Date' in self.data.columns and not self.data.empty:
+            latest_txn = self.data['Transaction Date'].max()
+            latest_summary = self.calculate_monthly_summary(
+                year=int(latest_txn.year),
+                month=int(latest_txn.month)
+            )
+
         for goal in goals:
             # Calculate current progress based on savings
             current_amount = goal.get('current_amount', 0)
@@ -314,11 +442,11 @@ class PersonalFinanceAnalytics:
             if target_amount > 0:
                 progress_percentage = (current_amount / target_amount) * 100
                 remaining_amount = target_amount - current_amount
-                
-                # Calculate time to goal based on current savings rate
-                monthly_savings = self.calculate_monthly_summary()['net_flow']
+
+                # Calculate time to goal based on latest available monthly savings
+                monthly_savings = latest_summary['net_flow'] if latest_summary else 0
                 months_to_goal = remaining_amount / monthly_savings if monthly_savings > 0 else float('inf')
-                
+
                 goal_progress.append({
                     'name': goal.get('name', 'Unnamed Goal'),
                     'current_amount': current_amount,
@@ -371,7 +499,7 @@ class PersonalFinanceAnalytics:
     def calculate_debt_analysis(self) -> Dict[str, float]:
         """Calculate debt-related metrics."""
         # This is a simplified version - in reality, you'd need more specific debt data
-        expenses = self.data[self.data['Amount'] < 0].copy()
+        expenses = self._expense_rows()
         
         # Identify potential debt payments (recurring negative amounts)
         recurring_expenses = expenses.groupby('Description')['Amount'].sum()
@@ -397,7 +525,8 @@ class PersonalFinanceAnalytics:
         recent_data = self.data[self.data['Transaction Date'] >= datetime.now() - timedelta(days=30)]
         
         # Category spending analysis
-        category_spending = recent_data[recent_data['Amount'] < 0].groupby('Category')['Amount'].sum().abs()
+        recent_expenses = self._expense_rows(recent_data)
+        category_spending = recent_expenses.groupby('Category')['Amount'].sum().abs()
         top_category = category_spending.idxmax() if len(category_spending) > 0 else None
         
         if top_category:
@@ -418,7 +547,7 @@ class PersonalFinanceAnalytics:
             insights.append("Great job! Your savings rate is above 20%.")
         
         # Spending frequency analysis
-        daily_spending = recent_data[recent_data['Amount'] < 0].groupby(recent_data['Transaction Date'].dt.date).size()
+        daily_spending = recent_expenses.groupby(recent_expenses['Transaction Date'].dt.date).size()
         avg_daily_transactions = daily_spending.mean()
         
         if avg_daily_transactions > 3:
@@ -444,22 +573,32 @@ class PersonalFinanceAnalytics:
         """Export comprehensive analysis report."""
         if filename is None:
             filename = f"personal_finance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
+
         # Generate comprehensive report
         report_data = []
-        
-        # Monthly summaries for last 12 months
-        for month in range(1, 13):
-            summary = self.calculate_monthly_summary(month=month)
+
+        if 'Transaction Date' in self.data.columns and not self.data.empty:
+            monthly_periods = (
+                self.data['Transaction Date']
+                .dt.to_period('M')
+                .sort_values()
+                .unique()
+            )
+        else:
+            monthly_periods = []
+
+        # Monthly summaries for up to the last 12 distinct periods
+        for period in monthly_periods[-12:]:
+            summary = self.calculate_monthly_summary(year=int(period.year), month=int(period.month))
             report_data.append({
-                'Period': f"2024-{month:02d}",
+                'Period': f"{period.year}-{period.month:02d}",
                 'Type': 'Monthly Summary',
                 'Income': summary['income'],
                 'Expenses': summary['expenses'],
                 'Net Flow': summary['net_flow'],
                 'Savings Rate': summary['savings_rate']
             })
-        
+
         # Category spending
         category_spending = self.calculate_category_spending()
         for category, row in category_spending.iterrows():

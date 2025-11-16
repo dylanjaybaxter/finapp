@@ -6,17 +6,14 @@ without import issues.
 """
 
 import sys
-import os
+from pathlib import Path
 
-# Add the current directory to Python path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
-
-# Change to the finance_dashboard directory
-os.chdir(os.path.join(current_dir, 'finance_dashboard'))
+# Add the project root to Python path
+project_root = Path(__file__).parent.resolve()
+sys.path.insert(0, str(project_root))
 
 # Import and run the enhanced dashboard
-from enhanced_dashboard import main
+from finance_dashboard.enhanced_dashboard import main
 
 if __name__ == "__main__":
     main()
