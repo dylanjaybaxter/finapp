@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Note: lib/ here refers to Python build lib, not our pages/lib directory
+# We explicitly allow finance_dashboard/pages/lib/
+lib/
+lib64/
+!finance_dashboard/pages/lib/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Database files (personal financial data)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+**/.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.local
+
+# Data directories (user-specific personal financial data)
+# Ignore all files in data/ and subdirectories, but keep directory structure
+# Ignore all files recursively
+data/**/*
+# But don't ignore directories (so we can track them with .gitkeep)
+!data/**/
+# And don't ignore .gitkeep files at any level
+!data/.gitkeep
+!data/**/.gitkeep
+
+# Personal financial data files (transaction data, budgets, etc.)
+# CSV files containing transaction data
+*.CSV
+*.csv
+**/*.CSV
+**/*.csv
+# JSON files with personal financial data (budgets, rules, cache, etc.)
+data/**/*.json
+**/persistent_cache.json
+**/category_rules.json
+**/recurring_plan.json
+# Sample data directory (may contain personal data)
+sample_data/**/*
+!sample_data/.gitkeep
+
