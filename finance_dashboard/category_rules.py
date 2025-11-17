@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple, Any
 from dataclasses import dataclass
 import re
 import pandas as pd
@@ -35,6 +35,8 @@ class CategoryRule:
     case_sensitive: bool = False
     whole_word: bool = False  # If True, match whole words only
     enabled: bool = True
+    start_date: Optional[str] = None  # YYYY-MM-DD format, None means no start limit
+    end_date: Optional[str] = None  # YYYY-MM-DD format, None means no end limit
 
 
 GLOBAL_PROFILE_KEY = "__all_profiles__"
@@ -88,15 +90,20 @@ class CategoryRulesManager:
                 profile_key = profile if profile else GLOBAL_PROFILE_KEY
                 entries = category_bucket.setdefault(profile_key, [])
 
-                if not rule.case_sensitive and not rule.whole_word and rule.enabled:
+                if not rule.case_sensitive and not rule.whole_word and rule.enabled and not rule.start_date and not rule.end_date:
                     entries.append(rule.keyword)
                 else:
-                    entries.append({
+                    rule_dict = {
                         'keyword': rule.keyword,
                         'case_sensitive': rule.case_sensitive,
                         'whole_word': rule.whole_word,
                         'enabled': rule.enabled,
-                    })
+                    }
+                    if rule.start_date:
+                        rule_dict['start_date'] = rule.start_date
+                    if rule.end_date:
+                        rule_dict['end_date'] = rule.end_date
+                    entries.append(rule_dict)
 
         with self.rules_file.open('w', encoding='utf-8') as f:
             json.dump({'rules': mapping}, f, indent=2, ensure_ascii=False)
@@ -112,11 +119,15 @@ class CategoryRulesManager:
                         case_sensitive = False
                         whole_word = False
                         enabled = True
+                        start_date = None
+                        end_date = None
                     else:
                         keyword = entry.get('keyword', '')
                         case_sensitive = entry.get('case_sensitive', False)
                         whole_word = entry.get('whole_word', False)
                         enabled = entry.get('enabled', True)
+                        start_date = entry.get('start_date')
+                        end_date = entry.get('end_date')
 
                     if not keyword:
                         continue
@@ -128,12 +139,15 @@ class CategoryRulesManager:
                             case_sensitive=case_sensitive,
                             whole_word=whole_word,
                             enabled=enabled,
+                            start_date=start_date,
+                            end_date=end_date
                         )
                     )
         return rules
     
     def add_rule(self, keyword: str, category: str, profiles: List[str] = None, 
-                 case_sensitive: bool = False, whole_word: bool = False) -> CategoryRule:
+                 case_sensitive: bool = False, whole_word: bool = False,
+                 start_date: Optional[str] = None, end_date: Optional[str] = None) -> CategoryRule:
         """Add a new category rule.
         
         Args:
@@ -142,6 +156,8 @@ class CategoryRulesManager:
             profiles: List of profile names to apply rule to. None/empty means all profiles.
             case_sensitive: Whether keyword matching is case-sensitive
             whole_word: Whether to match whole words only
+            start_date: Start date for rule validity (YYYY-MM-DD), None means no start limit
+            end_date: End date for rule validity (YYYY-MM-DD), None means no end limit
         
         Returns:
             The created CategoryRule
@@ -155,7 +171,9 @@ class CategoryRulesManager:
             profiles=profiles,
             case_sensitive=case_sensitive,
             whole_word=whole_word,
-            enabled=True
+            enabled=True,
+            start_date=start_date,
+            end_date=end_date
         )
         
         self.rules.append(rule)
@@ -220,24 +238,48 @@ class CategoryRulesManager:
             if r.enabled and (not r.profiles or profile_name in r.profiles)
         ]
     
-    def apply_rules(self, description: str, profile_name: Optional[str] = None) -> Optional[str]:
+    def apply_rules(self, description: str, profile_name: Optional[str] = None, track_history: bool = False, transaction_date: Optional[str] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
         """Apply rules to a transaction description and return category if matched.
         
         Args:
             description: Transaction description text
             profile_name: Profile name to filter rules by
+            track_history: If True, return list of applied rules in order
+            transaction_date: Transaction date in YYYY-MM-DD format for date range checking
         
         Returns:
-            Category name if a rule matches, None otherwise
+            Tuple of (category_name, rule_history)
+            - category_name: Category name if a rule matches, None otherwise
+            - rule_history: List of dicts with rule info (keyword, category, order) if track_history=True, else []
         """
         if not description:
-            return None
+            return None, []
         
         rules = self.get_rules(profile_name)
+        rule_history = []
         
-        for rule in rules:
+        for order, rule in enumerate(rules, start=1):
             if not rule.enabled:
                 continue
+            
+            # Check date range if transaction_date is provided
+            if transaction_date and (rule.start_date or rule.end_date):
+                try:
+                    from datetime import datetime as dt
+                    txn_dt = dt.strptime(transaction_date, '%Y-%m-%d').date()
+                    
+                    if rule.start_date:
+                        start_dt = dt.strptime(rule.start_date, '%Y-%m-%d').date()
+                        if txn_dt < start_dt:
+                            continue
+                    
+                    if rule.end_date:
+                        end_dt = dt.strptime(rule.end_date, '%Y-%m-%d').date()
+                        if txn_dt > end_dt:
+                            continue
+                except (ValueError, AttributeError):
+                    # If date parsing fails, skip date check (apply rule anyway)
+                    pass
             
             # Build pattern
             keyword = rule.keyword
@@ -255,9 +297,20 @@ class CategoryRulesManager:
                 pattern = re.escape(keyword)
             
             if re.search(pattern, desc):
-                return rule.category
+                if track_history:
+                    rule_history.append({
+                        'order': order,
+                        'keyword': rule.keyword,
+                        'category': rule.category,
+                        'case_sensitive': rule.case_sensitive,
+                        'whole_word': rule.whole_word,
+                        'profiles': rule.profiles,
+                        'start_date': rule.start_date,
+                        'end_date': rule.end_date
+                    })
+                return rule.category, rule_history
         
-        return None
+        return None, rule_history
     
     def get_all_keywords(self) -> Set[str]:
         """Get all unique keywords from rules."""
@@ -269,12 +322,14 @@ class CategoryRulesManager:
 
 
 def apply_category_rules_to_transactions(profile_name: Optional[str] = None, 
-                                        dry_run: bool = False) -> Dict[str, int]:
-    """Apply category rules to uncategorized transactions in the database.
+                                        dry_run: bool = False,
+                                        include_categorized: bool = True) -> Dict[str, int]:
+    """Apply category rules to transactions in the database.
     
     Args:
         profile_name: Profile name to filter rules by. None means use all applicable rules.
         dry_run: If True, don't actually update transactions, just return counts
+        include_categorized: If True, also apply rules to already-categorized transactions (default: True)
     
     Returns:
         Dict with 'updated', 'skipped', 'total_checked' counts
@@ -285,34 +340,56 @@ def apply_category_rules_to_transactions(profile_name: Optional[str] = None,
         import db
     
     manager = CategoryRulesManager()
-    uncategorized = db.fetch_uncategorized_transactions()
+    
+    # Fetch transactions - include categorized if requested
+    if include_categorized:
+        transactions = db.fetch_transactions()
+    else:
+        transactions = db.fetch_uncategorized_transactions()
     
     results = {
         'updated': 0,
         'skipped': 0,
-        'total_checked': len(uncategorized)
+        'total_checked': len(transactions)
     }
     
-    if uncategorized.empty:
+    if transactions.empty:
         return results
     
     # Get profile_name from transaction if available (from database)
-    for _, transaction in uncategorized.iterrows():
+    for _, transaction in transactions.iterrows():
         description = transaction.get('Description', '')
         if not description:
             results['skipped'] += 1
             continue
         
+        # Get transaction date for date range checking
+        transaction_date = None
+        txn_date = transaction.get('Transaction Date')
+        if pd.notna(txn_date):
+            if hasattr(txn_date, 'strftime'):
+                transaction_date = txn_date.strftime('%Y-%m-%d')
+            elif isinstance(txn_date, str):
+                transaction_date = txn_date
+        
         # Use transaction's profile_name if available, otherwise use parameter
         txn_profile = transaction.get('profile_name') if 'profile_name' in transaction else None
         rule_profile = profile_name or txn_profile
         
-        category = manager.apply_rules(description, rule_profile)
+        category, rule_history = manager.apply_rules(
+            description, 
+            rule_profile, 
+            track_history=True,
+            transaction_date=transaction_date
+        )
         
         if category:
             transaction_id = transaction.get('id')
             if transaction_id and not dry_run:
-                db.update_transaction(transaction_id, category=category)
+                # Store rule history as JSON
+                import json
+                rule_history_json = json.dumps(rule_history) if rule_history else None
+                db.update_transaction(transaction_id, category=category, rule_history=rule_history_json)
                 results['updated'] += 1
             elif dry_run:
                 results['updated'] += 1
@@ -348,9 +425,27 @@ def apply_rules_to_dataframe(df: pd.DataFrame, profile_name: Optional[str] = Non
     for idx in df[mask].index:
         description = df.loc[idx, 'Description']
         if pd.notna(description) and description:
-            category = manager.apply_rules(str(description), profile_name)
+            # Get transaction date if available
+            transaction_date = None
+            if 'Transaction Date' in df.columns:
+                txn_date = df.loc[idx, 'Transaction Date']
+                if pd.notna(txn_date):
+                    if hasattr(txn_date, 'strftime'):
+                        transaction_date = txn_date.strftime('%Y-%m-%d')
+                    elif isinstance(txn_date, str):
+                        transaction_date = txn_date
+            
+            category, rule_history = manager.apply_rules(
+                str(description), 
+                profile_name, 
+                track_history=True,
+                transaction_date=transaction_date
+            )
             if category:
                 df.loc[idx, 'Category'] = category
+                # Store rule history in dataframe for later database insertion
+                import json
+                df.loc[idx, 'rule_history'] = json.dumps(rule_history) if rule_history else None
     
     return df
 

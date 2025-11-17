@@ -10,11 +10,12 @@ import re
 
 import pandas as pd
 
-# Import configuration
+# Import configuration - use absolute import to avoid conflicts with pages/config
 try:
-    from .config import DB_PATH, RAW_DATA_DIR, ensure_data_directories
+    from finance_dashboard.config import DB_PATH, RAW_DATA_DIR, ensure_data_directories
 except ImportError:
-    from config import DB_PATH, RAW_DATA_DIR, ensure_data_directories
+    # Fallback for direct execution
+    from .config import DB_PATH, RAW_DATA_DIR, ensure_data_directories
 
 # Convert Path to string for backward compatibility with existing code
 DB_PATH_STR = str(DB_PATH)
@@ -99,7 +100,8 @@ def _migrate_database(conn) -> None:
         ('transaction_reference', 'TEXT'),
         ('fi_transaction_reference', 'TEXT'),
         ('original_amount', 'REAL'),
-        ('profile_name', 'TEXT')
+        ('profile_name', 'TEXT'),
+        ('rule_history', 'TEXT')  # JSON string storing applied rules in order
     ]
     
     for column_name, column_type in new_columns:
@@ -232,6 +234,13 @@ def upsert_transactions(df: pd.DataFrame, account: str = 'default', source_file:
         txn_ref = _sanitize_db_value(row.get('transaction_reference'))
         fi_ref = _sanitize_db_value(row.get('fi_transaction_reference'))
         orig_amt = _parse_amount(row.get('original_amount'))
+        # Get rule_history from dataframe if available (set during rule application)
+        rule_history = row.get('rule_history')
+        if rule_history is not None and not pd.isna(rule_history):
+            rule_history_str = str(rule_history) if not isinstance(rule_history, str) else rule_history
+        else:
+            rule_history_str = None
+        
         records.append((
             account,
             td,
@@ -249,13 +258,14 @@ def upsert_transactions(df: pd.DataFrame, account: str = 'default', source_file:
             _sanitize_db_value(source_file),
             _sanitize_db_value(profile_name),
             imported_at,
+            _sanitize_db_value(rule_history_str),
         ))
 
     insert_sql = (
         "INSERT OR IGNORE INTO transactions (account, transaction_date, post_date, description, "
         "normalized_description, category, type, amount, memo, currency, transaction_reference, "
-        "fi_transaction_reference, original_amount, source_file, profile_name, imported_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "fi_transaction_reference, original_amount, source_file, profile_name, imported_at, rule_history) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
     if not records:
@@ -297,7 +307,7 @@ def fetch_transactions(
         where.append("amount BETWEEN ? AND ?")
         params.extend([amount_range[0], amount_range[1]])
 
-    sql = "SELECT id, account, transaction_date AS 'Transaction Date', post_date AS 'Post Date', description AS 'Description', category AS 'Category', type AS 'Type', amount AS 'Amount', memo AS 'Memo', currency AS 'Currency', transaction_reference AS 'Transaction Reference', fi_transaction_reference AS 'FI Transaction Reference', original_amount AS 'Original Amount', source_file, profile_name AS 'profile_name' FROM transactions"
+    sql = "SELECT id, account, transaction_date AS 'Transaction Date', post_date AS 'Post Date', description AS 'Description', category AS 'Category', type AS 'Type', amount AS 'Amount', memo AS 'Memo', currency AS 'Currency', transaction_reference AS 'Transaction Reference', fi_transaction_reference AS 'FI Transaction Reference', original_amount AS 'Original Amount', source_file, profile_name AS 'profile_name', imported_at, rule_history FROM transactions"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY transaction_date ASC, id ASC"
@@ -325,6 +335,7 @@ def update_transaction(
     memo: Optional[str] = None,
     transaction_date: Optional[str] = None,
     txn_type: Optional[str] = None,
+    rule_history: Optional[str] = None,
 ) -> bool:
     """Update a transaction in the database.
     
@@ -368,6 +379,10 @@ def update_transaction(
         updates.append("type = ?")
         params.append(txn_type)
     
+    if rule_history is not None:
+        updates.append("rule_history = ?")
+        params.append(rule_history)
+    
     if not updates:
         return False
     
@@ -401,7 +416,7 @@ def fetch_transactions_by_category(category: str, include_null: bool = False) ->
 
 def fetch_uncategorized_transactions() -> pd.DataFrame:
     """Fetch all transactions with NULL or empty category."""
-    sql = "SELECT id, account, transaction_date AS 'Transaction Date', post_date AS 'Post Date', description AS 'Description', category AS 'Category', type AS 'Type', amount AS 'Amount', memo AS 'Memo', currency AS 'Currency', transaction_reference AS 'Transaction Reference', fi_transaction_reference AS 'FI Transaction Reference', original_amount AS 'Original Amount', source_file, profile_name FROM transactions WHERE category IS NULL OR category = '' ORDER BY transaction_date DESC, id DESC"
+    sql = "SELECT id, account, transaction_date AS 'Transaction Date', post_date AS 'Post Date', description AS 'Description', category AS 'Category', type AS 'Type', amount AS 'Amount', memo AS 'Memo', currency AS 'Currency', transaction_reference AS 'Transaction Reference', fi_transaction_reference AS 'FI Transaction Reference', original_amount AS 'Original Amount', source_file, profile_name, imported_at, rule_history FROM transactions WHERE category IS NULL OR category = '' ORDER BY transaction_date DESC, id DESC"
     
     with connect() as conn:
         df = pd.read_sql_query(sql, conn)
@@ -468,6 +483,144 @@ def get_all_profiles() -> List[str]:
             "SELECT DISTINCT profile_name FROM transactions WHERE profile_name IS NOT NULL ORDER BY profile_name"
         ).fetchall()
     return [row[0] for row in rows if row[0]]
+
+
+def search_transactions(
+    search_term: Optional[str] = None,
+    category: Optional[str] = None,
+    profile_name: Optional[str] = None,
+    source_file: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    amount_min: Optional[float] = None,
+    amount_max: Optional[float] = None,
+    limit: Optional[int] = None,
+    order_by: str = "transaction_date DESC, id DESC",
+    case_sensitive: bool = False
+) -> pd.DataFrame:
+    """Search transactions across the entire database with flexible filters.
+    
+    Args:
+        search_term: Search in description, memo, and transaction reference fields
+        category: Filter by category
+        profile_name: Filter by profile name
+        source_file: Filter by source file
+        start_date: Filter transactions on or after this date (YYYY-MM-DD)
+        end_date: Filter transactions on or before this date (YYYY-MM-DD)
+        amount_min: Minimum amount (absolute value)
+        amount_max: Maximum amount (absolute value)
+        limit: Maximum number of results to return
+        order_by: SQL ORDER BY clause (default: most recent first)
+        case_sensitive: If True, search is case-sensitive; if False, case-insensitive (default)
+    
+    Returns:
+        DataFrame with all transaction fields including metadata
+    """
+    where_clauses = []
+    params = []
+    
+    if search_term:
+        search_pattern = f"%{search_term}%"
+        if case_sensitive:
+            where_clauses.append(
+                "(description LIKE ? OR memo LIKE ? OR transaction_reference LIKE ? OR fi_transaction_reference LIKE ?)"
+            )
+        else:
+            # Use COLLATE NOCASE for case-insensitive search
+            where_clauses.append(
+                "(description LIKE ? COLLATE NOCASE OR memo LIKE ? COLLATE NOCASE OR transaction_reference LIKE ? COLLATE NOCASE OR fi_transaction_reference LIKE ? COLLATE NOCASE)"
+            )
+        params.extend([search_pattern, search_pattern, search_pattern, search_pattern])
+    
+    if category:
+        where_clauses.append("category = ?")
+        params.append(category)
+    
+    if profile_name:
+        where_clauses.append("profile_name = ?")
+        params.append(profile_name)
+    
+    if source_file:
+        where_clauses.append("source_file = ?")
+        params.append(source_file)
+    
+    if start_date:
+        where_clauses.append("transaction_date >= ?")
+        params.append(start_date)
+    
+    if end_date:
+        where_clauses.append("transaction_date <= ?")
+        params.append(end_date)
+    
+    if amount_min is not None:
+        where_clauses.append("ABS(amount) >= ?")
+        params.append(amount_min)
+    
+    if amount_max is not None:
+        where_clauses.append("ABS(amount) <= ?")
+        params.append(amount_max)
+    
+    sql = (
+        "SELECT id, account, transaction_date AS 'Transaction Date', post_date AS 'Post Date', "
+        "description AS 'Description', category AS 'Category', type AS 'Type', amount AS 'Amount', "
+        "memo AS 'Memo', currency AS 'Currency', transaction_reference AS 'Transaction Reference', "
+        "fi_transaction_reference AS 'FI Transaction Reference', original_amount AS 'Original Amount', "
+        "source_file, profile_name AS 'profile_name', imported_at, rule_history "
+        "FROM transactions"
+    )
+    
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    
+    sql += f" ORDER BY {order_by}"
+    
+    if limit:
+        sql += f" LIMIT {limit}"
+    
+    with connect() as conn:
+        df = pd.read_sql_query(sql, conn, params=params)
+    
+    # Convert dates back to datetime for UI
+    if not df.empty and 'Transaction Date' in df.columns:
+        df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+        if 'Post Date' in df.columns:
+            df['Post Date'] = pd.to_datetime(df['Post Date'])
+    
+    return df
+
+
+def get_transaction_by_id(transaction_id: int) -> Optional[pd.Series]:
+    """Get a single transaction by ID with all metadata.
+    
+    Args:
+        transaction_id: The transaction ID
+    
+    Returns:
+        Series with all transaction fields, or None if not found
+    """
+    sql = (
+        "SELECT id, account, transaction_date AS 'Transaction Date', post_date AS 'Post Date', "
+        "description AS 'Description', normalized_description, category AS 'Category', type AS 'Type', "
+        "amount AS 'Amount', memo AS 'Memo', currency AS 'Currency', "
+        "transaction_reference AS 'Transaction Reference', "
+        "fi_transaction_reference AS 'FI Transaction Reference', original_amount AS 'Original Amount', "
+        "source_file, profile_name AS 'profile_name', imported_at, rule_history "
+        "FROM transactions WHERE id = ?"
+    )
+    
+    with connect() as conn:
+        df = pd.read_sql_query(sql, conn, params=[transaction_id])
+    
+    if df.empty:
+        return None
+    
+    # Convert dates
+    if 'Transaction Date' in df.columns:
+        df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+    if 'Post Date' in df.columns:
+        df['Post Date'] = pd.to_datetime(df['Post Date'])
+    
+    return df.iloc[0]
 
 
 def auto_load_raw_files(raw_dir: Optional[str] = None) -> Dict[str, Any]:

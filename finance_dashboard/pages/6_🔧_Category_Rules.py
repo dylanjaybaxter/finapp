@@ -89,6 +89,23 @@ def _render_add_rule_form(manager: CategoryRulesManager, uncategorized: pd.DataF
             options=profile_options,
             help="Leave empty to apply to all profiles."
         )
+        
+        # Date range inputs
+        st.markdown("**Date Range (optional):**")
+        date_col1, date_col2 = st.columns(2)
+        with date_col1:
+            start_date = st.date_input(
+                "Start Date",
+                value=None,
+                help="Rule applies to transactions on or after this date. Leave empty for all-time."
+            )
+        with date_col2:
+            end_date = st.date_input(
+                "End Date",
+                value=None,
+                help="Rule applies to transactions on or before this date. Leave empty for all-time."
+            )
+        
         preview_placeholder = st.empty()
         if keyword:
             preview_placeholder.caption(_preview_matches(keyword, target_profiles, case_sensitive, uncategorized))
@@ -101,16 +118,22 @@ def _render_add_rule_form(manager: CategoryRulesManager, uncategorized: pd.DataF
             elif not selected_category.strip():
                 st.error("Choose or create a category.")
             else:
+                # Convert dates to strings if provided
+                start_date_str = start_date.isoformat() if start_date else None
+                end_date_str = end_date.isoformat() if end_date else None
+                
                 manager.add_rule(
                     keyword=keyword.strip(),
                     category=selected_category.strip(),
                     profiles=target_profiles or None,
                     case_sensitive=case_sensitive,
                     whole_word=whole_word,
+                    start_date=start_date_str,
+                    end_date=end_date_str
                 )
                 _apply_rules_for_profiles(target_profiles)
                 st.success(f"Rule '{keyword.strip()}' → '{selected_category.strip()}' added.")
-                st.experimental_rerun()
+                st.rerun()
 
 
 def _preview_matches(keyword: str, profiles: List[str], case_sensitive: bool, uncategorized: pd.DataFrame) -> str:
@@ -132,12 +155,22 @@ def _render_rules_grid(manager: CategoryRulesManager) -> None:
 
     data = []
     for rule in rules:
+        # Format date range
+        date_range = ""
+        if rule.start_date or rule.end_date:
+            start = rule.start_date or "all-time"
+            end = rule.end_date or "all-time"
+            date_range = f"{start} to {end}"
+        else:
+            date_range = "All-time"
+        
         data.append({
             'Keyword': rule.keyword,
             'Category': rule.category,
             'Profiles': ", ".join(rule.profiles) if rule.profiles else 'All',
             'Case-Sensitive': rule.case_sensitive,
             'Whole-Word': rule.whole_word,
+            'Date Range': date_range,
             'Enabled': rule.enabled,
         })
     df = pd.DataFrame(data)
@@ -157,7 +190,7 @@ def _render_rules_grid(manager: CategoryRulesManager) -> None:
         if st.button("Save changes", type="primary"):
             _persist_grid_changes(manager, df, edited)
             st.success("Rules updated.")
-            st.experimental_rerun()
+            st.rerun()
 
 
 def _persist_grid_changes(manager: CategoryRulesManager, original: pd.DataFrame, edited: pd.DataFrame) -> None:
@@ -228,27 +261,46 @@ def _render_apply_rules(manager: CategoryRulesManager, uncategorized: pd.DataFra
     profiles = ["All Profiles"] + list(registry._profiles.keys())
     selection = st.selectbox("Target profile", options=profiles)
     profile_name = None if selection == "All Profiles" else selection
+    
+    # Option to include already-categorized transactions
+    include_categorized = st.checkbox(
+        "Apply to all transactions (including already-categorized)",
+        value=True,
+        help="If checked, rules will update transactions even if they already have a category. If unchecked, only uncategorized transactions will be updated."
+    )
 
     cols = st.columns(2)
     with cols[0]:
         if st.button("🔍 Dry run", use_container_width=True):
             with st.spinner("Previewing..."):
-                res = apply_category_rules_to_transactions(profile_name=profile_name, dry_run=True)
+                res = apply_category_rules_to_transactions(
+                    profile_name=profile_name, 
+                    dry_run=True,
+                    include_categorized=include_categorized
+                )
             st.write(res)
     with cols[1]:
         if st.button("✅ Apply rules", type="primary", use_container_width=True):
             with st.spinner("Applying..."):
-                res = apply_category_rules_to_transactions(profile_name=profile_name, dry_run=False)
+                res = apply_category_rules_to_transactions(
+                    profile_name=profile_name, 
+                    dry_run=False,
+                    include_categorized=include_categorized
+                )
             st.success(f"Updated {res['updated']} transactions")
             if res['updated']:
                 st.balloons()
-            st.experimental_rerun()
+            st.rerun()
 
 
 def _apply_rules_for_profiles(profiles: Optional[List[str]]) -> None:
     targets = profiles or [None]
     for profile_name in targets:
-        apply_category_rules_to_transactions(profile_name=profile_name, dry_run=False)
+        apply_category_rules_to_transactions(
+            profile_name=profile_name, 
+            dry_run=False,
+            include_categorized=True  # Apply to all transactions when rule is added
+        )
 
 
 if __name__ == '__main__':

@@ -528,21 +528,28 @@ def render_unified_budget_system(
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Monthly Income", f"${income_estimate:,.2f}", help="3-month average")
-        total_budget = sum(budgets.values()) if budgets else 0.0
-        budget_pct = (total_budget / income_estimate * 100) if income_estimate > 0 else 0.0
+        
+        # Calculate budgeted amount from expenses envelopes only (excludes General Savings)
+        # This is the allocation to expense envelopes, not individual category budgets
+        expenses_pct = sum(
+            float(row.get('Target %', 0.0))
+            for row in envelope_config
+            if row.get('Type', expenses_type) == expenses_type
+        )
+        # Cap at 100% to ensure it never exceeds income
+        expenses_pct = min(expenses_pct, 100.0)
+        total_budget = (expenses_pct / 100.0) * income_estimate
+        
         with col2:
-            st.metric("Budgeted", f"${total_budget:,.2f}", delta=f"{budget_pct:.1f}%", help="Total budgeted expenses")
+            st.metric("Budgeted", f"${total_budget:,.2f}", delta=f"{expenses_pct:.1f}%", help="Total allocated to expense envelopes (excludes General Savings)")
+        
         remaining = income_estimate - total_budget
         remaining_pct = (remaining / income_estimate * 100) if income_estimate > 0 else 0.0
         with col3:
-            st.metric("Remaining", f"${remaining:,.2f}", delta=f"{remaining_pct:.1f}%", help="Available for savings")
+            st.metric("Remaining", f"${remaining:,.2f}", delta=f"{remaining_pct:.1f}%", help="Available for savings (General Savings)")
+        
+        savings_pct = 100.0 - expenses_pct
         with col4:
-            expenses_pct = sum(
-                float(row.get('Target %', 0.0))
-                for row in envelope_config
-                if row.get('Type', expenses_type) == expenses_type
-            )
-            savings_pct = 100.0 - expenses_pct
             st.metric("Savings Target", f"{savings_pct:.1f}%", f"${(savings_pct/100)*income_estimate:,.2f}", help="Auto-calculated from envelope allocation")
     else:
         no_income_msg = messages.get('no_income_data', "⚠️ No income data available. Upload transaction data with income to enable percentage-based budgeting.")
@@ -794,7 +801,12 @@ def render_unified_envelope_view(
             if envelope_budget_amounts:
                 expanded = expand_group_budgets(envelope_budget_amounts, analytics, groups)
                 st.session_state.budgets = expanded
-                total_budget = sum(expanded.values())
+                # Calculate total budget excluding Income and Transfer categories
+                exclude_categories = {'income', 'transfer', 'transfers'}
+                total_budget = sum(
+                    amount for category, amount in expanded.items()
+                    if category.lower() not in exclude_categories
+                )
             else:
                 st.session_state.budgets = {}
                 total_budget = 0.0
@@ -1105,6 +1117,10 @@ def render_budget_insights(
 ) -> None:
     """Render comprehensive budget insights and performance analysis.
     
+    Modern, interactive budget insights with professional UI/UX inspired by
+    leading financial tools. Organized by user priority: quick overview first,
+    then detailed analysis.
+    
     Args:
         budgets: Dictionary mapping category names to budget amounts
         analytics: Analytics object with transaction data
@@ -1137,13 +1153,25 @@ def render_budget_insights(
             """)
         return
     
+    # Exclude Income and Transfer categories from budget calculations
+    exclude_categories = {'income', 'transfer', 'transfers'}
+    expense_budgets = {
+        k: v for k, v in budgets.items()
+        if k.lower() not in exclude_categories
+    }
+    
+    if not expense_budgets:
+        st.warning("⚠️ No expense budgets set (only Income/Transfer categories found).")
+        return
+    
+    # Prepare data
     data = analytics.data.copy()
     data['Month'] = data['Transaction Date'].dt.to_period('M')
     if data.empty or 'Month' not in data:
         st.info("No data available in the selected window.")
         return
     
-    # Current month focus using 3-month average income
+    # Get configuration
     current_month = data['Month'].max()
     income_estimate = three_month_avg_income(analytics)
     default_env = _get_default_envelopes()
@@ -1151,6 +1179,7 @@ def render_budget_insights(
     groups_map = groups_from_envelopes(envelopes)
     targets_map = targets_from_envelopes(envelopes)
     
+    # Calculate current month performance
     current_expense = analytics._expense_rows(data[data['Month'] == current_month])
     current_expense['AbsAmount'] = current_expense['Amount'].abs()
     spend_by_group: Dict[str, float] = {}
@@ -1164,153 +1193,496 @@ def render_budget_insights(
         )
         spend_by_group[group] = spend_by_group.get(group, 0.0) + amount
     
-    st.subheader(f"Current month ({current_month}) performance")
-    cols = st.columns(4)
+    # Get performance data
+    perf_current, _ = budget_performance_snapshot(analytics, expense_budgets, current_only=True)
+    perf_all, months_count = budget_performance_snapshot(analytics, expense_budgets, current_only=False)
+    # perf_all is used in expandable section below
+    
+    # Calculate envelope metrics (used throughout)
+    constants = _get_constants()
+    envelope_types = constants['envelope_types']
+    expenses_type = envelope_types['expenses']
+    
+    envelope_data = []
+    if targets_map:
+        for group, target_pct in targets_map.items():
+            # Only count expenses envelopes (exclude General Savings)
+            envelope_type = next(
+                (row.get('Type', expenses_type) for row in envelopes if row.get('Group') == group),
+                expenses_type
+            )
+            if envelope_type == expenses_type:
+                target_dollars = income_estimate * target_pct if income_estimate > 0 else 0.0
+                actual = spend_by_group.get(group, 0.0)
+                pct_used = (actual / target_dollars * 100) if target_dollars > 0 else 0.0
+                variance = actual - target_dollars
+                
+                envelope_data.append({
+                    'Envelope': group,
+                    'Target %': target_pct * 100,
+                    'Target $': target_dollars,
+                    'Actual $': actual,
+                    'Variance': variance,
+                    '% Used': pct_used,
+                    'Status': 'Over' if variance > 0 else 'Under'
+                })
+    
+    env_df = pd.DataFrame(envelope_data) if envelope_data else pd.DataFrame()
+    
+    # ============================================================================
+    # SECTION 1: QUICK OVERVIEW - Key Metrics (Envelope-Based)
+    # ============================================================================
+    st.markdown("### 📊 Quick Overview")
+    
+    # Calculate monthly budget from envelope targets × income (NOT sum of categories)
+    expenses_pct = sum(
+        float(row.get('Target %', 0.0))
+        for row in envelopes
+        if row.get('Type', expenses_type) == expenses_type
+    ) if envelopes else 0.0
+    expenses_pct = min(expenses_pct, 100.0)  # Cap at 100%
+    total_budget = (expenses_pct / 100.0) * income_estimate if income_estimate > 0 else 0.0
+    
     current_spend_total = sum(spend_by_group.values())
     savings_amt = income_estimate - current_spend_total if income_estimate else 0.0
-    utilization = (current_spend_total / income_estimate * 100) if income_estimate else None
-    cols[0].metric("3-mo avg income", f"${income_estimate:,.0f}")
-    cols[1].metric("Current spend", f"${current_spend_total:,.0f}")
-    cols[2].metric("Saved so far", f"${savings_amt:,.0f}", delta=f"{(savings_amt/income_estimate*100):+.1f}%" if income_estimate else None)
-    cols[3].metric("Utilization vs income", f"{utilization:,.1f}%" if utilization is not None else "–")
+    savings_rate = (savings_amt / income_estimate * 100) if income_estimate > 0 else 0.0
+    budget_utilization = (current_spend_total / total_budget * 100) if total_budget > 0 else 0.0
     
-    st.markdown("#### Envelope utilization vs targets")
-    st.markdown(
-        """
-        <style>
-        .env-label {font-size:0.95rem;font-weight:700;margin-bottom:4px;color:#2563eb;}
-        .env-meta {font-size:0.85rem;color:#1f2937;margin-top:4px;font-style:normal;}
-        .env-badge {display:inline-block;padding:2px 6px;margin:2px 4px 0 0;border-radius:6px;background:#eef2f7;font-style:normal;}
-        .env-badge.over {background:#f4d6d4;color:#5a1a15;}
-        .env-badge.under {background:#d9ead3;color:#1d4d1b;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    env_cols = st.columns(len(targets_map) or 1)
-    for idx, (group, target_pct) in enumerate(targets_map.items()):
-        target_dollars = income_estimate * target_pct
-        actual = spend_by_group.get(group, 0.0)
-        pct_used = (actual / target_dollars * 100) if target_dollars else 0.0
-        bar = min(max(pct_used / 100.0, 0.0), 2.0)  # cap bar at 200%
-        caption = f"Target $ {target_dollars:,.0f} · Actual $ {actual:,.0f} · {pct_used:,.1f}%"
-        variance = actual - target_dollars
-        status_class = 'over' if variance > 0 else 'under'
-        status_emoji = '⚠️ ' if variance > 0 and target_dollars else '✅ '
-        with env_cols[idx % len(env_cols)]:
-            st.markdown(f"<div class='env-label'>{status_emoji}{group}</div>", unsafe_allow_html=True)
-            st.progress(bar, text=caption)
-            meta = (
-                f"<div class='env-meta'>"
-                f"<span class='env-badge'>Target $ {target_dollars:,.0f}</span>"
-                f"<span class='env-badge'>Actual $ {actual:,.0f}</span>"
-                f"<span class='env-badge {status_class}'>Variance {variance:+,.0f}</span>"
-                f"<span class='env-badge {status_class}'>{pct_used:,.1f}% of target</span>"
-                f"</div>"
-            )
-            st.markdown(meta, unsafe_allow_html=True)
+    # Count over-budget envelopes (for potential future use)
+    # over_budget_envelopes = int((env_df['Status'] == 'Over').sum()) if not env_df.empty else 0
     
-    # Performance snapshots for whole range
-    perf_range, months_count = budget_performance_snapshot(analytics, budgets, current_only=False)
-    st.markdown("### Budget vs Actual (date range)")
-    if not perf_range.empty:
-        render_perf_table(perf_range)
-        render_perf_chart(perf_range, title=f"{months_count} mo: Budget vs Actual (total)", use_total=True)
-        render_variance_focus(perf_range)
-    else:
-        st.caption("No budgets matched to expenses in the current window.")
-    
-    # Envelope performance by month (targets vs actuals)
-    st.markdown("### Envelope performance by month")
-    monthly_groups = monthly_group_targets_actuals(analytics, targets_map, groups_map)
-    if not monthly_groups.empty:
-        def _highlight_status(row):
-            status = row.get('Status')
-            if status == 'Over':
-                return ['background-color: #d99a9a; color: #111; font-weight: 600'] * len(row)
-            if status == 'Under':
-                return ['background-color: #b7d3b0; color: #111; font-weight: 600'] * len(row)
-            return [''] * len(row)
-        
-        display_df = monthly_groups.fillna(0)
-        st.dataframe(
-            display_df.style.apply(_highlight_status, axis=1).format({
-                'Target ($)': '${:,.0f}',
-                'Actual ($)': '${:,.0f}',
-                'Target % Income': '{:,.1f}%',
-                'Actual % Income': '{:,.1f}%'
-            }),
-            use_container_width=True,
-            hide_index=True,
+    # Display key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            "Monthly Income",
+            f"${income_estimate:,.0f}",
+            help="3-month average income"
         )
-        recent = monthly_groups[monthly_groups['Month'].isin(monthly_groups['Month'].unique()[-6:])]
-        for group in recent['Group'].unique():
-            sub = recent[recent['Group'] == group]
-            colors = ['#d62728' if act > tgt else '#1f77b4' for act, tgt in zip(sub['Actual ($)'], sub['Target ($)'])]
-            fig_env = go.Figure()
-            fig_env.add_bar(name=f'{group} Actual', x=sub['Month'], y=sub['Actual ($)'], marker_color=colors)
-            fig_env.add_scatter(name=f'{group} Target', x=sub['Month'], y=sub['Target ($)'], mode='lines+markers', line=dict(color='#555'), marker=dict(symbol='diamond'))
-            fig_env.update_layout(title=f'{group}: monthly target vs actual', barmode='group', xaxis_tickangle=-25)
-            st.plotly_chart(fig_env, use_container_width=True)
-    else:
-        st.caption("No spending data matched to envelope groups in this window.")
+    with col2:
+        st.metric(
+            "Monthly Budget",
+            f"${total_budget:,.0f}",
+            delta=f"{expenses_pct:.1f}% of income",
+            help="Total allocated to expense envelopes"
+        )
+    with col3:
+        st.metric(
+            "Current Month Spend",
+            f"${current_spend_total:,.0f}",
+            delta=f"{budget_utilization:.1f}% of budget",
+            delta_color="inverse" if budget_utilization > 100 else "normal",
+            help="Total spending this month"
+        )
+    with col4:
+        st.metric(
+            "Savings Rate",
+            f"{savings_rate:.1f}%",
+            delta=f"${savings_amt:,.0f}",
+            help="Percentage of income saved this month"
+        )
     
-    # Spend vs income by month (actuals)
-    st.markdown("### Spend vs income by month")
+    st.divider()
+    
+    # ============================================================================
+    # SECTION 2: ENVELOPE PERFORMANCE - PRIMARY FOCUS
+    # ============================================================================
+    if not env_df.empty:
+        st.markdown("### 💼 Envelope Performance")
+        st.caption(f"Current month ({current_month}) - Target vs Actual spending by envelope")
+        
+        # Sort by % used (most critical first)
+        env_df_display = env_df.sort_values('% Used', ascending=False).copy()
+        
+        # Create detailed envelope cards with metrics
+        for _, row in env_df_display.iterrows():
+            with st.container():
+                # Create a card-like container
+                envelope_name = row['Envelope']
+                target_pct = row['Target %']
+                target_dollars = row['Target $']
+                actual_dollars = row['Actual $']
+                variance = row['Variance']
+                pct_used = row['% Used']
+                status = row['Status']
+                
+                # Determine status icon
+                if status == 'Over' or pct_used > 100:
+                    status_icon = "⚠️"
+                elif pct_used > 80:
+                    status_icon = "⚡"
+                else:
+                    status_icon = "✅"
+                
+                # Create envelope card
+                card_col1, card_col2 = st.columns([2, 1])
+                
+                with card_col1:
+                    st.markdown(f"#### {status_icon} {envelope_name}")
+                    
+                    # Progress bar with custom styling
+                    progress_value = min(pct_used / 100.0, 1.0)
+                    st.progress(
+                        progress_value,
+                        text=f"${actual_dollars:,.0f} of ${target_dollars:,.0f} ({pct_used:.1f}%)"
+                    )
+                    
+                    # Metrics row
+                    metric_col1, metric_col2, metric_col3 = st.columns(3)
+                    with metric_col1:
+                        st.metric("Target", f"${target_dollars:,.0f}", f"{target_pct:.1f}% of income")
+                    with metric_col2:
+                        st.metric("Actual", f"${actual_dollars:,.0f}")
+                    with metric_col3:
+                        delta_color = "inverse" if variance > 0 else "normal"
+                        st.metric("Variance", f"${abs(variance):,.0f}", 
+                                delta=f"{'Over' if variance > 0 else 'Under'}",
+                                delta_color=delta_color)
+                
+                with card_col2:
+                    # Visual indicator
+                    remaining = target_dollars - actual_dollars if variance <= 0 else 0
+                    remaining_pct = (remaining / target_dollars * 100) if target_dollars > 0 else 0
+                    
+                    if variance > 0:
+                        st.error(f"**Over by ${abs(variance):,.0f}**")
+                        st.caption(f"{pct_used:.1f}% of target used")
+                    else:
+                        st.success(f"**${remaining:,.0f} remaining**")
+                        st.caption(f"{remaining_pct:.1f}% of target left")
+                
+                st.divider()
+        
+        # Envelope comparison chart
+        if len(env_df_display) > 0:
+            fig_envelopes = go.Figure()
+            fig_envelopes.add_trace(go.Bar(
+                name='Target',
+                x=env_df_display['Envelope'],
+                y=env_df_display['Target $'],
+                marker_color='#3b82f6',
+                text=env_df_display['Target $'].apply(lambda x: f'${x:,.0f}'),
+                textposition='outside'
+            ))
+            fig_envelopes.add_trace(go.Bar(
+                name='Actual',
+                x=env_df_display['Envelope'],
+                y=env_df_display['Actual $'],
+                marker_color=['#ef4444' if s == 'Over' else '#10b981' for s in env_df_display['Status']],
+                text=env_df_display['Actual $'].apply(lambda x: f'${x:,.0f}'),
+                textposition='outside'
+            ))
+            fig_envelopes.update_layout(
+                title='Envelope Performance: Target vs Actual (Current Month)',
+                barmode='group',
+                xaxis_tickangle=-45,
+                height=450,
+                showlegend=True,
+                hovermode='x unified'
+            )
+            st.plotly_chart(fig_envelopes, use_container_width=True)
+        
+        st.divider()
+        
+        # ============================================================================
+        # SECTION 3: ENVELOPE ALERTS - Actionable Items
+        # ============================================================================
+        over_envelopes = env_df_display[env_df_display['Status'] == 'Over']
+        if not over_envelopes.empty:
+            st.markdown("### ⚠️ Envelope Alerts")
+            st.warning(f"{len(over_envelopes)} envelope(s) exceeding their targets this month")
+            
+            for _, row in over_envelopes.iterrows():
+                with st.container():
+                    col1, col2, col3 = st.columns([3, 2, 1])
+                    with col1:
+                        st.markdown(f"**{row['Envelope']}**")
+                    with col2:
+                        st.markdown(f"Target: ${row['Target $']:,.0f} → Actual: ${row['Actual $']:,.0f}")
+                    with col3:
+                        st.error(f"${abs(row['Variance']):,.0f} over ({row['% Used']:.1f}%)")
+            
+            st.divider()
+    
+    # ============================================================================
+    # SECTION 4: ENVELOPE TRENDS - Historical Performance
+    # ============================================================================
+    if targets_map:
+        st.markdown("### 📈 Envelope Trends")
+        
+        monthly_groups = monthly_group_targets_actuals(analytics, targets_map, groups_map)
+        if not monthly_groups.empty:
+            # Filter to expenses envelopes only
+            expenses_envelopes = [
+                row.get('Group') for row in envelopes
+                if row.get('Type', expenses_type) == expenses_type
+            ]
+            monthly_expenses = monthly_groups[monthly_groups['Group'].isin(expenses_envelopes)]
+            
+            if not monthly_expenses.empty:
+                # Get available months
+                available_months = sorted(monthly_expenses['Month'].unique())
+                
+                # Time period selector
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    period_options = {
+                        "Last 3 months": 3,
+                        "Last 6 months": 6,
+                        "Last 12 months": 12,
+                        "All available": len(available_months)
+                    }
+                    selected_period = st.selectbox(
+                        "Time Period",
+                        options=list(period_options.keys()),
+                        index=1,  # Default to 6 months
+                        key="envelope_trends_period"
+                    )
+                    months_to_show = period_options[selected_period]
+                
+                # Select months based on period
+                if months_to_show >= len(available_months):
+                    recent_months = available_months
+                    period_label = f"All {len(available_months)} months"
+                else:
+                    recent_months = available_months[-months_to_show:]
+                    period_label = f"Last {months_to_show} months"
+                
+                recent = monthly_expenses[monthly_expenses['Month'].isin(recent_months)]
+                
+                st.caption(f"Historical performance: {period_label}")
+                
+                # Create a comprehensive chart showing all envelopes
+                fig_trends = go.Figure()
+                for group in recent['Group'].unique():
+                    sub = recent[recent['Group'] == group].sort_values('Month')
+                    fig_trends.add_trace(go.Scatter(
+                        name=f'{group} Actual',
+                        x=sub['Month'],
+                        y=sub['Actual ($)'],
+                        mode='lines+markers',
+                        line=dict(width=2),
+                        marker=dict(size=8)
+                    ))
+                    fig_trends.add_trace(go.Scatter(
+                        name=f'{group} Target',
+                        x=sub['Month'],
+                        y=sub['Target ($)'],
+                        mode='lines',
+                        line=dict(dash='dash', width=1),
+                        opacity=0.6,
+                        showlegend=False
+                    ))
+                
+                fig_trends.update_layout(
+                    title=f'Envelope Performance Trends ({period_label})',
+                    xaxis_title='Month',
+                    yaxis_title='Amount ($)',
+                    height=450,
+                    hovermode='x unified',
+                    xaxis_tickangle=-45
+                )
+                st.plotly_chart(fig_trends, use_container_width=True)
+                
+                # Summary table
+                summary_data = []
+                for group in recent['Group'].unique():
+                    sub = recent[recent['Group'] == group]
+                    avg_actual = sub['Actual ($)'].mean()
+                    avg_target = sub['Target ($)'].mean()
+                    avg_variance = avg_actual - avg_target
+                    
+                    summary_data.append({
+                        'Envelope': group,
+                        'Avg Target': avg_target,
+                        'Avg Actual': avg_actual,
+                        'Avg Variance': avg_variance,
+                        'Avg % Used': (avg_actual / avg_target * 100) if avg_target > 0 else 0
+                    })
+                
+                summary_df = pd.DataFrame(summary_data)
+                summary_df = summary_df.sort_values('Avg % Used', ascending=False)
+                
+                def _color_summary(row):
+                    pct = row.get('Avg % Used', 0)
+                    if pct > 100:
+                        return ['background-color: #fca5a5; color: #7f1d1d; font-weight: 600'] * len(row)
+                    elif pct > 80:
+                        return ['background-color: #fbbf24; color: #78350f; font-weight: 600'] * len(row)
+                    return [''] * len(row)
+                
+                st.dataframe(
+                    summary_df.style.apply(_color_summary, axis=1).format({
+                        'Avg Target': '${:,.0f}',
+                        'Avg Actual': '${:,.0f}',
+                        'Avg Variance': '${:,.0f}',
+                        'Avg % Used': '{:.1f}%'
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No envelope trend data available.")
+        else:
+            st.info("No historical envelope data available.")
+        
+        st.divider()
+    
+    # ============================================================================
+    # SECTION 5: SAVINGS & INCOME TRENDS
+    # ============================================================================
+    st.markdown("### 💰 Savings & Income Overview")
+    
     monthly = monthly_income_vs_spend(analytics)
     if not monthly.empty:
-        # Calculate saved % of income if not already present
         if 'Saved % of Income' not in monthly.columns:
             monthly['Saved % of Income'] = (monthly['Savings'] / monthly['Income'] * 100).fillna(0.0)
-        else:
-            monthly['Saved % of Income'] = monthly['Saved % of Income'].fillna(0.0)
         
-        st.dataframe(
-            monthly.style.format({
-                'Income': '${:,.0f}',
-                'Spending': '${:,.0f}',
-                'Savings': '${:,.0f}',
-                'Saved % of Income': '{:,.1f}%'
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-        fig_m = go.Figure()
-        fig_m.add_bar(name='Income', x=monthly['Month'], y=monthly['Income'], marker_color='#1f77b4')
-        fig_m.add_bar(name='Spending', x=monthly['Month'], y=monthly['Spending'], marker_color='#ff7f0e')
-        fig_m.add_bar(name='Savings', x=monthly['Month'], y=monthly['Savings'], marker_color='#2ca02c')
-        fig_m.update_layout(barmode='group', title='Monthly income, spend, and savings', xaxis_tickangle=-25)
-        st.plotly_chart(fig_m, use_container_width=True)
-    else:
-        st.caption("Not enough data to compare income and spend by month.")
+        # Compact savings rate chart
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_savings = go.Figure()
+            fig_savings.add_trace(go.Scatter(
+                x=monthly['Month'],
+                y=monthly['Saved % of Income'],
+                mode='lines+markers',
+                name='Savings Rate',
+                line=dict(color='#10b981', width=3),
+                marker=dict(size=8),
+                fill='tozeroy',
+                fillcolor='rgba(16, 185, 129, 0.1)'
+            ))
+            fig_savings.add_hline(
+                y=20,
+                line_dash="dash",
+                line_color="gray",
+                annotation_text="20% target",
+                annotation_position="right"
+            )
+            fig_savings.update_layout(
+                title='Savings Rate Over Time',
+                xaxis_title='Month',
+                yaxis_title='Savings % of Income',
+                height=300,
+                hovermode='x unified',
+                showlegend=False
+            )
+            st.plotly_chart(fig_savings, use_container_width=True)
+        
+        with col2:
+            # Current month summary
+            latest = monthly.iloc[-1] if not monthly.empty else None
+            if latest is not None:
+                st.metric("Latest Month Income", f"${latest['Income']:,.0f}")
+                st.metric("Latest Month Spending", f"${latest['Spending']:,.0f}")
+                st.metric("Latest Month Savings", f"${latest['Savings']:,.0f}", 
+                         delta=f"{latest['Saved % of Income']:.1f}%")
+        
+        st.divider()
     
-    # Category share of income
-    st.markdown("### Spend as % of income")
-    income_series = income_series_complete(analytics)
-    percent_df = category_percent_income(analytics, income_series)
-    if not percent_df.empty:
-        capped = percent_df.copy()
-        vmax = capped['Percent'].quantile(0.9) if not capped['Percent'].empty else None
-        if vmax and vmax > 0:
-            capped['Percent'] = capped['Percent'].clip(upper=vmax)
-        heatmap = capped.pivot(index='Month', columns='Category', values='Percent').fillna(0)
-        fig = px.imshow(
-            heatmap,
-            aspect='auto',
-            color_continuous_scale='RdPu',
-            title='Expense categories as % of monthly income (clipped)',
-            labels=dict(color='% income'),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.caption("Need at least one month of income and expense data to compute percentages.")
+    # ============================================================================
+    # SECTION 6: DETAILED ANALYSIS - Expandable Sections (Categories & Details)
+    # ============================================================================
+    with st.expander("📋 Individual Category Performance", expanded=False):
+        st.caption("Detailed breakdown by individual category (less commonly used)")
+        
+        if not perf_current.empty:
+            display_df = perf_current.copy()
+            display_df['% Used'] = (display_df['Actual/mo'] / display_df['Budget/mo'] * 100).fillna(0)
+            display_df = display_df.sort_values('% Used', ascending=False)
+            
+            display_df = display_df[[
+                'Category', 'Budget/mo', 'Actual/mo', 'Variance/mo', '% Used', 'Status'
+            ]].copy()
+            display_df.columns = ['Category', 'Budget', 'Actual', 'Variance', '% Used', 'Status']
+            
+            def _color_code_performance(row):
+                pct_used = row.get('% Used', 0)
+                status = row.get('Status', '')
+                if status == 'Over' or pct_used > 100:
+                    return ['background-color: #fca5a5; color: #7f1d1d; font-weight: 600'] * len(row)
+                elif pct_used > 80:
+                    return ['background-color: #fbbf24; color: #78350f; font-weight: 600'] * len(row)
+                else:
+                    return [''] * len(row)
+            
+            st.dataframe(
+                display_df.style.apply(_color_code_performance, axis=1).format({
+                    'Budget': '${:,.0f}',
+                    'Actual': '${:,.0f}',
+                    'Variance': '${:,.0f}',
+                    '% Used': '{:.1f}%'
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Category chart (compact)
+            if len(display_df) > 0:
+                top_categories = display_df.head(8)  # Show top 8
+                fig_cats = go.Figure()
+                fig_cats.add_trace(go.Bar(
+                    name='Budget',
+                    x=top_categories['Category'],
+                    y=top_categories['Budget'],
+                    marker_color='#3b82f6'
+                ))
+                fig_cats.add_trace(go.Bar(
+                    name='Actual',
+                    x=top_categories['Category'],
+                    y=top_categories['Actual'],
+                    marker_color='#ef4444'
+                ))
+                fig_cats.update_layout(
+                    title='Top Categories: Budget vs Actual',
+                    barmode='group',
+                    xaxis_tickangle=-45,
+                    height=350,
+                    showlegend=True
+                )
+                st.plotly_chart(fig_cats, use_container_width=True)
+        else:
+            st.info("No category performance data available.")
     
-    # Trendline (omit if no budget signal)
-    if budgets and sum(budgets.values()) > 0:
-        trend_df = budget_trend_dataframe(analytics, budgets)
-        nonzero = trend_df[trend_df['Amount'] > 0] if not trend_df.empty else pd.DataFrame()
-        if not nonzero.empty:
-            st.markdown("### Trendline")
-            fig_trend = px.line(nonzero, x='Month', y='Amount', color='Metric', markers=True, title='Budget vs Actual trend')
-            st.plotly_chart(fig_trend, use_container_width=True)
+    with st.expander("📊 All-Time Category Summary", expanded=False):
+        if not perf_all.empty:
+            st.dataframe(
+                perf_all.style.format({
+                    'Budget/mo': '${:,.0f}',
+                    'Actual/mo': '${:,.0f}',
+                    'Variance/mo': '${:,.0f}',
+                    'Target Total': '${:,.0f}',
+                    'Actual Total': '${:,.0f}',
+                    'Variance Total': '${:,.0f}',
+                    'Percent Used': '{:.1f}%'
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No performance data available.")
+    
+    with st.expander("📉 Category Share of Income", expanded=False):
+        income_series = income_series_complete(analytics)
+        percent_df = category_percent_income(analytics, income_series)
+        if not percent_df.empty:
+            avg_pct = percent_df.groupby('Category')['Percent'].mean().sort_values(ascending=False).head(10)
+            fig_pct = go.Figure()
+            fig_pct.add_trace(go.Bar(
+                x=avg_pct.values,
+                y=avg_pct.index,
+                orientation='h',
+                marker_color='#8b5cf6',
+                text=[f'{v:.1f}%' for v in avg_pct.values],
+                textposition='outside'
+            ))
+            fig_pct.update_layout(
+                title='Top Categories: Average % of Income',
+                xaxis_title='% of Income',
+                height=400
+            )
+            st.plotly_chart(fig_pct, use_container_width=True)
+        else:
+            st.info("Need income data to compute category percentages.")
 
