@@ -9,9 +9,10 @@ interface compared to the basic dashboard.
 from __future__ import annotations
 
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -25,24 +26,38 @@ except ImportError:
 
 class PersonalFinanceUI:
     """Enhanced UI components for personal finance management."""
-    
-    def __init__(self):
-        """Initialize the Personal Finance UI."""
-        self.setup_page_config()
+    _PAGE_CONFIGURED = False
+
+    def __init__(self, *, configure_page: bool = False):
+        """Initialize the Personal Finance UI.
+
+        Args:
+            configure_page: When True, call ``setup_page_config`` immediately.
+        """
+        if configure_page:
+            self.setup_page_config()
     
     def setup_page_config(self) -> None:
         """Configure Streamlit page settings for personal finance."""
-        st.set_page_config(
-            page_title="Personal Finance Dashboard",
-            page_icon="💰",
-            layout="wide",
-            initial_sidebar_state="expanded",
-            menu_items={
-                'Get Help': 'https://github.com/your-repo/personal-finance-dashboard',
-                'Report a bug': "https://github.com/your-repo/personal-finance-dashboard/issues",
-                'About': "Personal Finance Dashboard - Take control of your money!"
-            }
-        )
+        if PersonalFinanceUI._PAGE_CONFIGURED:
+            return
+        try:
+            st.set_page_config(
+                page_title="Personal Finance Dashboard",
+                page_icon="💰",
+                layout="wide",
+                initial_sidebar_state="expanded",
+                menu_items={
+                    'Get Help': 'https://github.com/your-repo/personal-finance-dashboard',
+                    'Report a bug': "https://github.com/your-repo/personal-finance-dashboard/issues",
+                    'About': "Personal Finance Dashboard - Take control of your money!"
+                }
+            )
+        except StreamlitAPIException:
+            # Already configured upstream; avoid raising to keep reruns smooth.
+            pass
+        finally:
+            PersonalFinanceUI._PAGE_CONFIGURED = True
     
     def render_header(self) -> None:
         """Render the main dashboard header."""
@@ -67,7 +82,7 @@ class PersonalFinanceUI:
         """Render quick action buttons for common tasks."""
         st.subheader("🚀 Quick Actions")
         
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
             if st.button("➕ Add Transaction", help="Manually add a transaction"):
@@ -84,6 +99,10 @@ class PersonalFinanceUI:
         with col4:
             if st.button("📈 View Reports", help="Generate financial reports"):
                 st.session_state.show_reports = True
+        
+        with col5:
+            if st.button("✏️ Edit Transactions", help="Edit transfers and uncategorized transactions"):
+                st.session_state.show_transaction_editor = True
     
     def render_financial_overview(self, data: pd.DataFrame, filters: Dict = None) -> None:
         """Render key financial metrics overview for selected period."""
@@ -95,11 +114,11 @@ class PersonalFinanceUI:
         
         # Calculate period summary instead of monthly
         analytics = PersonalFinanceAnalytics(data)
-        
+
         # Get date range from filters or use all data
         start_date = filters.get('start_date') if filters else None
         end_date = filters.get('end_date') if filters else None
-        
+
         period_summary = analytics.calculate_period_summary(start_date, end_date)
         
         col1, col2, col3, col4 = st.columns(4)
@@ -134,128 +153,6 @@ class PersonalFinanceUI:
                 help="Percentage of income saved"
             )
         
-        # Show largest expenses instead of recent transactions
-        st.subheader("🔍 Largest Expenses")
-        largest_expenses = period_summary['largest_expenses']
-        
-        if not largest_expenses.empty:
-            # Display as a table with clickable rows
-            for idx, row in largest_expenses.iterrows():
-                col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-                
-                with col1:
-                    st.write(f"**{row['Description']}**")
-                
-                with col2:
-                    st.write(f"${row['Amount']:,.2f}")
-                
-                with col3:
-                    st.write(f"{row['Category']}")
-                
-                with col4:
-                    if st.button("📋", key=f"detail_{idx}", help="View transaction details"):
-                        st.session_state[f'show_transaction_{idx}'] = True
-                
-                # Show transaction details if clicked
-                if st.session_state.get(f'show_transaction_{idx}', False):
-                    with st.expander(f"Transaction Details - {row['Description']}"):
-                        st.write(f"**Date:** {row['Transaction Date'].strftime('%Y-%m-%d')}")
-                        st.write(f"**Amount:** ${row['Amount']:,.2f}")
-                        st.write(f"**Category:** {row['Category']}")
-                        st.write(f"**Type:** {row['Type']}")
-                        if pd.notna(row['Memo']):
-                            st.write(f"**Memo:** {row['Memo']}")
-                        if st.button("Close", key=f"close_{idx}"):
-                            st.session_state[f'show_transaction_{idx}'] = False
-                            st.rerun()
-        else:
-            st.info("No expenses found for the selected period.")
-    
-    def render_monthly_panel(self, data: pd.DataFrame, filters: Dict = None) -> None:
-        """Render interactive monthly spending panel."""
-        st.subheader("📅 Monthly Breakdown")
-        
-        if data.empty:
-            st.warning("No data available for the selected period.")
-            return
-        
-        analytics = PersonalFinanceAnalytics(data)
-        
-        # Get date range from filters or use all data
-        start_date = filters.get('start_date') if filters else None
-        end_date = filters.get('end_date') if filters else None
-        
-        monthly_breakdown = analytics.calculate_monthly_breakdown(start_date, end_date)
-        
-        if monthly_breakdown.empty:
-            st.info("No monthly data available.")
-            return
-        
-        # Display monthly data in a table with clickable rows
-        for _, row in monthly_breakdown.iterrows():
-            col1, col2, col3, col4, col5, col6 = st.columns([2, 2, 2, 2, 1, 1])
-            
-            with col1:
-                st.write(f"**{row['Month_Label']}**")
-            
-            with col2:
-                if st.button(f"💰 ${row['Income']:,.0f}", key=f"income_{row['Month_Label']}", help="View income transactions"):
-                    st.session_state[f'show_income_{row["Month_Label"]}'] = True
-            
-            with col3:
-                if st.button(f"💸 ${row['Expenses']:,.0f}", key=f"expenses_{row['Month_Label']}", help="View expense transactions"):
-                    st.session_state[f'show_expenses_{row["Month_Label"]}'] = True
-            
-            with col4:
-                net_color = "green" if row['Net'] > 0 else "red"
-                st.markdown(f"<span style='color: {net_color}'>${row['Net']:,.0f}</span>", unsafe_allow_html=True)
-            
-            with col5:
-                st.write(f"{row['Transaction_Count']} txn")
-            
-            with col6:
-                if st.button("📊", key=f"details_{row['Month_Label']}", help="View all transactions"):
-                    st.session_state[f'show_all_{row["Month_Label"]}'] = True
-            
-            # Show transactions for clicked month
-            if st.session_state.get(f'show_income_{row["Month_Label"]}', False):
-                with st.expander(f"Income Transactions - {row['Month_Label']}"):
-                    month_data = analytics.get_transactions_by_month(row['Year'], row['Month'])
-                    income_data = month_data[month_data['Amount'] > 0]
-                    if not income_data.empty:
-                        st.dataframe(income_data[['Transaction Date', 'Description', 'Amount', 'Category']], use_container_width=True)
-                    else:
-                        st.info("No income transactions found.")
-                    if st.button("Close", key=f"close_income_{row['Month_Label']}"):
-                        st.session_state[f'show_income_{row["Month_Label"]}'] = False
-                        st.rerun()
-            
-            if st.session_state.get(f'show_expenses_{row["Month_Label"]}', False):
-                with st.expander(f"Expense Transactions - {row['Month_Label']}"):
-                    month_data = analytics.get_transactions_by_month(row['Year'], row['Month'])
-                    expense_data = month_data[month_data['Amount'] < 0]
-                    if not expense_data.empty:
-                        expense_data['Amount'] = expense_data['Amount'].abs()
-                        st.dataframe(expense_data[['Transaction Date', 'Description', 'Amount', 'Category']], use_container_width=True)
-                    else:
-                        st.info("No expense transactions found.")
-                    if st.button("Close", key=f"close_expenses_{row['Month_Label']}"):
-                        st.session_state[f'show_expenses_{row["Month_Label"]}'] = False
-                        st.rerun()
-            
-            if st.session_state.get(f'show_all_{row["Month_Label"]}', False):
-                with st.expander(f"All Transactions - {row['Month_Label']}"):
-                    month_data = analytics.get_transactions_by_month(row['Year'], row['Month'])
-                    if not month_data.empty:
-                        display_data = month_data.copy()
-                        display_data['Amount'] = display_data['Amount'].abs()
-                        st.dataframe(display_data[['Transaction Date', 'Description', 'Amount', 'Category', 'Type']], use_container_width=True)
-                    else:
-                        st.info("No transactions found.")
-                    if st.button("Close", key=f"close_all_{row['Month_Label']}"):
-                        st.session_state[f'show_all_{row["Month_Label"]}'] = False
-                        st.rerun()
-    
     def render_spending_breakdown(self, data: pd.DataFrame, filters: Dict = None) -> None:
         """Render spending breakdown by category with clickable pie chart."""
         st.subheader("💳 Spending Breakdown")
@@ -316,54 +213,37 @@ class PersonalFinanceUI:
             st.info("No budgets set. Click 'Set Budget' to create your first budget.")
             return
         
-        # Calculate actual spending vs budget
-        current_month = datetime.now().strftime("%Y-%m")
-        monthly_data = self._filter_by_month(data, current_month)
-        
-        budget_data = []
-        for category, budget_amount in budgets.items():
-            actual_spending = abs(monthly_data[monthly_data['Category'] == category]['Amount'].sum())
-            budget_data.append({
-                'Category': category,
-                'Budget': budget_amount,
-                'Actual': actual_spending,
-                'Remaining': budget_amount - actual_spending,
-                'Percentage': (actual_spending / budget_amount * 100) if budget_amount > 0 else 0
-            })
-        
-        budget_df = pd.DataFrame(budget_data)
-        
-        # Create budget vs actual chart
+        if data.empty:
+            st.info("No transactions match the current filters.")
+            return
+
+        analytics = PersonalFinanceAnalytics(data)
+        performance = analytics.calculate_budget_performance(budgets)
+        if performance.empty:
+            st.info("No spending available for the selected period.")
+            return
+
+        total_budget = sum(budgets.values())
+        total_actual = performance['Actual'].sum()
+        variance = total_budget - total_actual
+        cols = st.columns(3)
+        cols[0].metric("Budgeted", f"${total_budget:,.2f}")
+        cols[1].metric("Actual", f"${total_actual:,.2f}")
+        cols[2].metric("Variance", f"${variance:,.2f}", delta_color="inverse")
+
         fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            name='Budget',
-            x=budget_df['Category'],
-            y=budget_df['Budget'],
-            marker_color='lightblue'
-        ))
-        
-        fig.add_trace(go.Bar(
-            name='Actual',
-            x=budget_df['Category'],
-            y=budget_df['Actual'],
-            marker_color='orange'
-        ))
-        
-        fig.update_layout(
-            title="Budget vs Actual Spending",
-            xaxis_title="Category",
-            yaxis_title="Amount ($)",
-            barmode='group'
-        )
-        
+        fig.add_trace(go.Bar(name='Budget', x=performance['Category'], y=performance['Budget'], marker_color='#1f77b4'))
+        fig.add_trace(go.Bar(name='Actual', x=performance['Category'], y=performance['Actual'], marker_color='#ff7f0e'))
+        fig.update_layout(title="Budget vs Actual", barmode='group', xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Budget status table
-        st.markdown("**Budget Status**")
-        for _, row in budget_df.iterrows():
-            status = "✅" if row['Remaining'] >= 0 else "❌"
-            st.markdown(f"{status} **{row['Category']}**: ${row['Actual']:,.2f} / ${row['Budget']:,.2f} ({row['Percentage']:.1f}%)")
+
+        st.markdown("**Status by category**")
+        performance['Variance'] = performance['Budget'] - performance['Actual']
+        st.dataframe(
+            performance[['Category', 'Budget', 'Actual', 'Variance', 'Status']]
+            .style.format({'Budget': '${:,.2f}', 'Actual': '${:,.2f}', 'Variance': '${:,.2f}'}),
+            use_container_width=True,
+        )
     
     def render_spending_trends(self, data: pd.DataFrame) -> None:
         """Render spending trends over time."""
@@ -536,54 +416,171 @@ class PersonalFinanceUI:
                 remaining = goal['target_amount'] - goal['current_amount']
                 st.metric("Remaining", f"${remaining:,.2f}")
     
-    def render_sidebar_filters(self, data: pd.DataFrame) -> Dict:
+    def render_sidebar_filters(self, data: pd.DataFrame, defaults: Optional[Dict] = None) -> Dict:
         """Render sidebar filters and controls."""
+        defaults = defaults or {}
         st.sidebar.header("🔍 Filters & Controls")
-        
+
+        total_rows = len(data)
+        accounts = data['profile_name'].nunique() if 'profile_name' in data.columns else 1
+        amount_series = pd.to_numeric(data['Amount'], errors='coerce') if 'Amount' in data.columns else pd.Series(dtype=float)
+        spend = abs(amount_series[amount_series < 0].sum()) if not amount_series.empty else 0.0
+        income = amount_series[amount_series > 0].sum() if not amount_series.empty else 0.0
+        meta_col1, meta_col2 = st.sidebar.columns(2)
+        meta_col1.metric("Transactions", f"{total_rows:,}")
+        meta_col2.metric("Profiles", f"{accounts:,}")
+        st.sidebar.caption(f"Flow snapshot: +${income:,.0f} / -${spend:,.0f}")
+
         # Date range filter
         st.sidebar.subheader("📅 Date Range")
+        date_options = ["Transaction Date", "Post Date"]
+        cached_date_col = defaults.get('date_col')
+        if cached_date_col not in date_options:
+            cached_date_col = date_options[0]
         date_col = st.sidebar.selectbox(
             "Date Column",
-            options=["Transaction Date", "Post Date"],
-            index=0
+            options=date_options,
+            index=date_options.index(cached_date_col)
         )
-        
+
+        def _coerce_cached_date(text: Optional[str]) -> Optional[date]:
+            if not text:
+                return None
+            try:
+                return pd.to_datetime(text).date()
+            except Exception:
+                return None
+
+        start_date_value = _coerce_cached_date(defaults.get('start_date'))
+        end_date_value = _coerce_cached_date(defaults.get('end_date'))
+        date_range = None
         if date_col in data.columns:
-            data[date_col] = pd.to_datetime(data[date_col])
-            min_date = data[date_col].min().date()
-            max_date = data[date_col].max().date()
-            
-            date_range = st.sidebar.date_input(
-                "Select Date Range",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date
-            )
+            safe_data = data.copy()
+            safe_data[date_col] = pd.to_datetime(safe_data[date_col], errors='coerce')
+            valid_dates = safe_data[date_col].dropna()
+            if not valid_dates.empty:
+                min_date = valid_dates.min().date()
+                max_date = valid_dates.max().date()
+                if start_date_value and not (min_date <= start_date_value <= max_date):
+                    start_date_value = None
+                if end_date_value and not (min_date <= end_date_value <= max_date):
+                    end_date_value = None
+                date_range = st.sidebar.date_input(
+                    "Select Date Range",
+                    value=(start_date_value or min_date, end_date_value or max_date),
+                    min_value=min_date,
+                    max_value=max_date
+                )
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_date_value, end_date_value = date_range
+                elif date_range:
+                    start_date_value = min_date
+                    end_date_value = date_range
+
+        st.sidebar.caption("Or enter dates manually (YYYY-MM-DD)")
+        manual_start = st.sidebar.text_input(
+            "Start Date",
+            value=start_date_value.isoformat() if start_date_value else ""
+        ).strip()
+        manual_end = st.sidebar.text_input(
+            "End Date",
+            value=end_date_value.isoformat() if end_date_value else ""
+        ).strip()
+
+        def _parse_manual(text: str):
+            if not text:
+                return None
+            try:
+                return pd.to_datetime(text).date()
+            except Exception:
+                st.sidebar.warning(f"Invalid date: {text}. Use YYYY-MM-DD format.")
+                return None
+
+        manual_start_date = _parse_manual(manual_start)
+        manual_end_date = _parse_manual(manual_end)
+        if manual_start_date:
+            start_date_value = manual_start_date
+        if manual_end_date:
+            end_date_value = manual_end_date
+
+        amount_series = pd.to_numeric(data['Amount'], errors='coerce') if 'Amount' in data.columns else pd.Series(dtype=float)
+        categories = sorted([c for c in data['Category'].dropna().unique().tolist()]) if 'Category' in data.columns else []
+        type_options = sorted(data['Type'].dropna().unique().tolist()) if 'Type' in data.columns else []
+
+        if amount_series.dropna().empty:
+            min_amount, max_amount = 0.0, 0.0
         else:
-            date_range = None
-        
-        # Category filter
-        st.sidebar.subheader("🏷️ Categories")
-        categories = data['Category'].unique()
-        selected_categories = st.sidebar.multiselect(
-            "Select Categories",
-            options=categories,
-            default=categories
-        )
-        
-        # Amount filter
-        st.sidebar.subheader("💰 Amount Range")
-        amount_range = st.sidebar.slider(
-            "Amount Range",
-            min_value=float(data['Amount'].min()),
-            max_value=float(data['Amount'].max()),
-            value=(float(data['Amount'].min()), float(data['Amount'].max()))
-        )
+            min_amount = float(amount_series.min())
+            max_amount = float(amount_series.max())
+            if min_amount == max_amount:
+                buffer_value = max(1.0, abs(min_amount) * 0.05)
+                min_amount -= buffer_value
+                max_amount += buffer_value
+
+        cached_categories = defaults.get('selected_categories') or categories
+        default_categories = [c for c in cached_categories if c in categories] if categories else []
+        if categories and not default_categories:
+            default_categories = categories
+        cached_types = defaults.get('transaction_types') or type_options
+        default_types = [t for t in cached_types if t in type_options] if type_options else []
+        if type_options and not default_types:
+            default_types = type_options
+        cached_amount_range = defaults.get('amount_range') if defaults else None
+        if isinstance(cached_amount_range, (list, tuple)) and len(cached_amount_range) == 2:
+            try:
+                cached_min = float(cached_amount_range[0])
+                cached_max = float(cached_amount_range[1])
+            except (TypeError, ValueError):
+                cached_min, cached_max = min_amount, max_amount
+            cached_min = max(min_amount, min(cached_min, max_amount))
+            cached_max = max(min_amount, min(cached_max, max_amount))
+            if cached_min > cached_max:
+                cached_min, cached_max = cached_max, cached_min
+            default_amount_range = (cached_min, cached_max)
+        else:
+            default_amount_range = (min_amount, max_amount)
+        search_text_default = defaults.get('search_text') or ""
+        expenses_only_default = bool(defaults.get('expenses_only'))
+
+        with st.sidebar.popover("Advanced filters", use_container_width=True):
+            st.caption("Fine-tune the view by category, transaction type, amount, or search text.")
+            selected_categories = st.multiselect(
+                "Categories",
+                options=categories,
+                default=default_categories,
+            )
+            selected_types = st.multiselect(
+                "Transaction types",
+                options=type_options,
+                default=default_types,
+            )
+            search_text = st.text_input(
+                "Keyword search",
+                placeholder="e.g. rent, netflix, grocery",
+                value=search_text_default,
+            ).strip()
+            amount_range = st.slider(
+                "Amount range",
+                min_value=min_amount,
+                max_value=max_amount,
+                value=default_amount_range
+            )
+            expenses_only = st.checkbox(
+                "Expenses only",
+                value=expenses_only_default,
+                help="Hide inflows to focus purely on outgoing commitments.",
+            )
+
         return {
             'date_range': date_range,
             'selected_categories': selected_categories,
             'amount_range': amount_range,
-            'date_col': date_col
+            'date_col': date_col,
+            'start_date': start_date_value.isoformat() if start_date_value else None,
+            'end_date': end_date_value.isoformat() if end_date_value else None,
+            'transaction_types': selected_types,
+            'search_text': search_text or None,
+            'expenses_only': expenses_only,
         }
     
     def render_add_transaction_form(self) -> Optional[Dict]:
@@ -612,14 +609,22 @@ class PersonalFinanceUI:
             submitted = st.form_submit_button("Add Transaction")
             
             if submitted:
-                return {
-                    'date': date,
-                    'description': description,
-                    'category': category,
-                    'amount': amount,
-                    'type': transaction_type,
-                    'memo': memo
-                }
+                if not description.strip():
+                    st.error("Description is required to add a transaction.")
+                else:
+                    return {
+                        'Transaction Date': date,
+                        'Post Date': date,
+                        'Description': description.strip(),
+                        'Category': category,
+                        'Type': transaction_type,
+                        'Amount': float(amount),
+                        'Memo': memo.strip() if memo else None,
+                        'Currency': None,
+                        'Transaction Reference': None,
+                        'FI Transaction Reference': None,
+                        'Original Amount': None
+                    }
         
         return None
     
@@ -681,8 +686,10 @@ class PersonalFinanceUI:
     def _filter_by_month(self, data: pd.DataFrame, month: str) -> pd.DataFrame:
         """Filter data by month."""
         if 'Transaction Date' in data.columns:
-            data['Transaction Date'] = pd.to_datetime(data['Transaction Date'])
-            return data[data['Transaction Date'].dt.to_period('M') == month]
+            working = data.copy()
+            working['Transaction Date'] = pd.to_datetime(working['Transaction Date'], errors='coerce')
+            month_period = month if isinstance(month, pd.Period) else pd.Period(str(month), freq='M')
+            return working[working['Transaction Date'].dt.to_period('M') == month_period]
         return data
     
     def render_mobile_optimized_view(self) -> None:

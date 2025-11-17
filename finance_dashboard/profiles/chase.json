@@ -1,0 +1,85 @@
+{
+  "name": "chase_details_v1",
+  "description": "Chase activity export containing Details and Posting Date columns (Chase2997 style).",
+  "match": {
+    "filename_patterns": ["Chase2997_Activity"],
+    "header_contains": [
+      "Details",
+      "Posting Date",
+      "Description",
+      "Amount",
+      "Type"
+    ]
+  },
+  "requirements": {
+    "required_normalized_fields": [
+      "Transaction Date",
+      "Description",
+      "Amount"
+    ]
+  },
+  "fields": {
+    "column_mappings": {
+      "Transaction Date": ["Posting Date"],
+      "Post Date": ["Posting Date"],
+      "Description": ["Description"],
+      "Type": ["Type"],
+      "Flow Direction": ["Details"],
+      "Amount": ["Amount"],
+      "Balance": ["Balance"],
+      "Check Number": ["Check or Slip #"]
+    },
+    "category_mappings": {
+      "Flow Direction": {
+        "CREDIT": "Income",
+        "DEBIT": "Expense"
+      },
+      "Type": {
+        "ACH_CREDIT": "Income",
+        "MISC_CREDIT": "Income",
+        "ACH_DEBIT": "Expense",
+        "MISC_DEBIT": "Expense"
+      }
+    },
+    "category_groups": {
+      "Type": {
+        "Dining": ["DINING", "RESTAURANT"],
+        "Groceries": ["GROCERY", "GROCERIES"],
+        "Transportation": ["TOLL", "RIDESHARE", "TRANSIT"],
+        "Utilities": ["UTILITY", "UTILITIES"],
+        "Travel": ["TRAVEL", "AIRFARE", "HOTEL"],
+        "Housing": ["MORTGAGE", "RENT"],
+        "Health": ["HEALTH", "MEDICAL"],
+        "Entertainment": ["ENTERTAINMENT", "MOVIE"],
+        "Shopping": ["POS", "DEBIT_CARD", "PURCHASE", "SHOPPING"],
+        "Fees": ["FEE"],
+        "Income": ["ACH_CREDIT", "MISC_CREDIT", "DIRECTDEP", "DEPOSIT"],
+        "Transfers": ["TRANSFER", "ACH"],
+        "Other": ["ACH_DEBIT", "MISC_DEBIT", "ACH DEBIT", "ATM", "CHECK", "OTHER", "UNCATEGORIZED"]
+      }
+    },
+    "description_keywords": {
+      "Dining": ["CAFE", "COFFEE", "TACO", "PIZZA", "BURGER", "GRILL", "RESTAURANT", "BAR ", "DINER"],
+      "Groceries": ["GROCERY", "SAFEWAY", "WHOLE FOODS", "TRADER JOE", "MARKET"],
+      "Transportation": ["UBER", "LYFT", "TAXI", "SHELL", "EXXON", "CHEVRON", "PARKING", "METRO"],
+      "Utilities": ["COMCAST", "PG&E", "AT&T", "VERIZON", "T-MOBILE", "UTILITY"],
+      "Travel": ["AIRLINE", "AIRWAYS", "MARRIOTT", "HILTON", "HOTEL", "AIRBNB", "CAR RENTAL"],
+      "Housing": ["RENT", "MORTGAGE", "APARTMENT", "PROPERTY MGMT", "Apar"],
+      "Health": ["PHARMACY", "CVS", "WALGREENS", "CLINIC", "MEDICAL", "HOSPITAL"],
+      "Entertainment": ["NETFLIX", "SPOTIFY", "HULU", "DISNEY", "THEATER", "GAMING"],
+      "Shopping": ["AMAZON", "TARGET", "WALMART", "BEST BUY", "APPLE", "SHOP"],
+      "Fees": ["FEE", "SERVICE CHARGE", "MAINTENANCE"],
+      "Income": ["PAYROLL", "SALARY", "DEPOSIT", "VENMO CASHOUT"],
+      "Transfers": ["TRANSFER", "PAYPAL", "XFER"],
+      "Other": ["MISC", "UNCATEGORIZED", "ZELLE", "VENMO", "ADJUSTMENT"]
+    }
+  },
+  "transformations": {
+    "Amount": {
+      "type": "indicator_sign",
+      "indicator_field": "Flow Direction",
+      "credit_values": ["CREDIT"],
+      "debit_values": ["DEBIT"]
+    }
+  }
+}

@@ -27,11 +27,22 @@ pip install -r requirements.txt >/dev/null
 
 echo "✅ Dependencies installed successfully!"
 
-# Create data directory for user data
-mkdir -p data
-mkdir -p data/budgets
-mkdir -p data/goals
-mkdir -p data/reports
+# Create data directories using Python config (ensures consistency)
+python3 -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path('$PROJECT_ROOT')))
+try:
+    from finance_dashboard.config import ensure_data_directories
+    ensure_data_directories()
+except ImportError:
+    # Fallback if config not available
+    import os
+    os.makedirs('data/raw', exist_ok=True)
+    os.makedirs('data/budgets', exist_ok=True)
+    os.makedirs('data/goals', exist_ok=True)
+    os.makedirs('data/reports', exist_ok=True)
+"
 
 echo "📊 Starting Enhanced Personal Finance Dashboard..."
 echo "🌐 Dashboard will be available at: http://localhost:8501"

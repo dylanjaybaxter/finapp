@@ -1,0 +1,106 @@
+{
+  "constants": {
+    "savings_group_name": "General Savings",
+    "envelope_types": {
+      "expenses": "expenses",
+      "savings": "savings"
+    },
+    "default_budget_name": "My Budget"
+  },
+  "keywords": {
+    "needs": [
+      "housing", "rent", "mortgage", "utilities", "electric", "water", "gas",
+      "heating", "cooling", "insurance", "healthcare", "medical", "doctor",
+      "hospital", "pharmacy", "prescription", "transportation", "car", "vehicle",
+      "auto", "gas", "fuel", "parking", "toll", "public transit", "groceries",
+      "food", "grocery", "supermarket", "debt", "loan", "student loan",
+      "credit card", "phone", "internet", "utilities", "childcare", "child care",
+      "daycare", "education", "tuition", "tax", "property tax", "income tax",
+      "essential", "necessity", "required", "mandatory"
+    ],
+    "wants": [
+      "dining", "restaurant", "cafe", "coffee", "takeout", "delivery",
+      "fast food", "entertainment", "movie", "theater", "concert", "sports",
+      "game", "streaming", "netflix", "shopping", "retail", "clothing",
+      "apparel", "fashion", "accessories", "travel", "vacation", "hotel",
+      "flight", "airline", "trip", "tourism", "subscription", "membership",
+      "gym", "fitness", "yoga", "personal care", "beauty", "salon", "hobbies",
+      "hobby", "craft", "music", "books", "gifts", "gift", "charity",
+      "donation", "luxury", "optional", "discretionary", "recreation",
+      "leisure", "fun"
+    ]
+  },
+  "default_envelopes": [
+    {
+      "group": "Essentials (Needs)",
+      "type": "expenses",
+      "target_percent": 50.0,
+      "categories": [
+        "Housing", "Rent", "Rent/Mortgage", "Mortgage", "Utilities",
+        "Insurance", "Healthcare", "Medical", "Transportation", "Gas",
+        "Groceries", "Debt Payment", "Student Loan", "Phone", "Internet",
+        "Childcare"
+      ]
+    },
+    {
+      "group": "Lifestyle (Wants)",
+      "type": "expenses",
+      "target_percent": 30.0,
+      "categories": [
+        "Dining", "Entertainment", "Shopping", "Travel", "Subscriptions",
+        "Fitness", "Personal Care", "Hobbies", "Gifts"
+      ]
+    },
+    {
+      "group": "General Savings",
+      "type": "savings",
+      "target_percent": 0.0,
+      "categories": []
+    }
+  ],
+  "ui": {
+    "labels": {
+      "save_button": "💾 Save Budget",
+      "delete_button": "Delete",
+      "save_envelope_settings": "Save envelope settings",
+      "add_envelope": "➕ Add Envelope",
+      "budget_name_input": "Budget Name",
+      "select_budget": "Select Budget",
+      "create_new": "Create New",
+      "manage_budgets": "Manage Budgets",
+      "budget_insights": "Budget Insights",
+      "envelope_view": "Envelope View",
+      "category_view": "Category View"
+    },
+    "messages": {
+      "no_budget": "No budgets set. Create a budget to get started.",
+      "empty_budget": "This budget is empty. Add categories and set budget amounts.",
+      "no_categories": "No categories available. Import transaction data to see categories.",
+      "no_income_data": "⚠️ No income data available. Upload transaction data with income to enable percentage-based budgeting.",
+      "budget_saved": "✅ Saved budget '{name}'! {count} categories ({percent}% of income, {total} total)",
+      "budget_deleted": "🗑️ Deleted budget '{name}'",
+      "envelope_updated": "Envelope configuration updated.",
+      "unassigned_categories": "⚠️ Some categories are not assigned to any envelope. Please assign all categories before saving.",
+      "exceeds_100_percent": "⚠️ Expenses allocation exceeds 100% ({percent}%). Please adjust percentages.",
+      "total_exceeds_100_percent": "⚠️ Total budget exceeds 100% of income ({percent}%). Please adjust."
+    },
+    "validation": {
+      "max_percentage": 100.0,
+      "tolerance": 0.01,
+      "min_percentage": 0.0,
+      "max_envelope_name_length": 100
+    },
+    "help_text": {
+      "budget_name": "Enter a name for this budget",
+      "target_percent": "Percentage of monthly income to allocate to this envelope",
+      "envelope_type": "Expenses: counts toward allocation. Savings: special category for later analytics.",
+      "category_selection": "Select categories to include in this envelope"
+    }
+  },
+  "calculations": {
+    "income_months": 3,
+    "income_series_frequency": "M",
+    "default_income_estimate": 0.0
+  }
+}
+

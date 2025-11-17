@@ -1,0 +1,2030 @@
+"""Next-generation budget planning workspace."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from datetime import datetime
+import sys
+from typing import Dict, List, Optional, Any
+
+import json
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+PARENT = Path(__file__).parent.parent
+if str(PARENT) not in sys.path:
+    sys.path.insert(0, str(PARENT))
+
+from shared_sidebar import render_shared_sidebar, apply_filters
+from personal_finance_analytics import PersonalFinanceAnalytics
+import db
+
+try:
+    from config import BUDGETS_DIR, ensure_data_directories
+except ImportError:  # Fallback for direct execution
+    from pathlib import Path as _Path
+    BUDGETS_DIR = _Path(__file__).resolve().parents[1] / 'data' / 'budgets'
+
+    def ensure_data_directories() -> None:
+        BUDGETS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _income_series_complete(analytics: PersonalFinanceAnalytics) -> pd.Series:
+    data = analytics.data.copy()
+    if data.empty:
+        return pd.Series(dtype=float)
+    data['Month'] = data['Transaction Date'].dt.to_period('M')
+    pos = data[data['Amount'] > 0].copy()
+    if pos.empty:
+        return pd.Series(dtype=float)
+    current_month = pd.Period(pd.Timestamp.utcnow().date(), freq='M')
+    pos = pos[pos['Month'] < current_month]
+    income = pos.groupby('Month')['Amount'].sum().sort_index()
+    income.index = income.index.astype(str)
+    return income
+
+
+def _three_month_avg_income(analytics: Optional[PersonalFinanceAnalytics]) -> float:
+    if analytics is None or analytics.data.empty:
+        return 0.0
+    series = _income_series_complete(analytics)
+    if series.empty:
+        return 0.0
+    recent = series.sort_index(ascending=False).head(3)
+    return float(recent.mean()) if not recent.empty else 0.0
+
+SAVINGS_GROUP_NAME = 'General Savings'
+# Note: General Savings does not have categories - it's calculated as remainder
+
+# Default envelopes based on 50/30/20 rule (Needs/Wants/Savings)
+# Savings is auto-calculated as remainder of unallocated income
+ENVELOPE_TYPE_EXPENSES = 'expenses'
+ENVELOPE_TYPE_SAVINGS = 'savings'
+
+# Keywords to help categorize expenses into Needs vs Wants
+NEEDS_KEYWORDS = {
+    'housing', 'rent', 'mortgage', 'utilities', 'electric', 'water', 'gas', 'heating', 'cooling',
+    'insurance', 'healthcare', 'medical', 'doctor', 'hospital', 'pharmacy', 'prescription',
+    'transportation', 'car', 'vehicle', 'auto', 'gas', 'fuel', 'parking', 'toll', 'public transit',
+    'groceries', 'food', 'grocery', 'supermarket', 'debt', 'loan', 'student loan', 'credit card',
+    'phone', 'internet', 'utilities', 'childcare', 'child care', 'daycare', 'education', 'tuition',
+    'tax', 'property tax', 'income tax', 'essential', 'necessity', 'required', 'mandatory'
+}
+
+WANTS_KEYWORDS = {
+    'dining', 'restaurant', 'cafe', 'coffee', 'takeout', 'delivery', 'fast food',
+    'entertainment', 'movie', 'theater', 'concert', 'sports', 'game', 'streaming', 'netflix',
+    'shopping', 'retail', 'clothing', 'apparel', 'fashion', 'accessories',
+    'travel', 'vacation', 'hotel', 'flight', 'airline', 'trip', 'tourism',
+    'subscription', 'membership', 'gym', 'fitness', 'yoga', 'personal care', 'beauty', 'salon',
+    'hobbies', 'hobby', 'craft', 'music', 'books', 'gifts', 'gift', 'charity', 'donation',
+    'luxury', 'optional', 'discretionary', 'recreation', 'leisure', 'fun'
+}
+
+DEFAULT_ENVELOPES = [
+    {
+        'Group': 'Essentials (Needs)',
+        'Type': ENVELOPE_TYPE_EXPENSES,
+        'Target %': 50.0,  # 50% - Housing, utilities, food, insurance, healthcare, transportation
+        'Categories': ', '.join([
+            'Housing', 'Rent', 'Rent/Mortgage', 'Mortgage', 'Utilities', 'Insurance',
+            'Healthcare', 'Medical', 'Transportation', 'Gas', 'Groceries', 'Debt Payment',
+            'Student Loan', 'Phone', 'Internet', 'Childcare'
+        ])
+    },
+    {
+        'Group': 'Lifestyle (Wants)',
+        'Type': ENVELOPE_TYPE_EXPENSES,
+        'Target %': 30.0,  # 30% - Dining, entertainment, shopping, travel, subscriptions
+        'Categories': ', '.join([
+            'Dining', 'Entertainment', 'Shopping', 'Travel', 'Subscriptions', 'Fitness',
+            'Personal Care', 'Hobbies', 'Gifts'
+        ])
+    },
+    {
+        'Group': SAVINGS_GROUP_NAME,
+        'Type': ENVELOPE_TYPE_SAVINGS,
+        'Target %': 0.0,  # Auto-calculated as remainder - not manually editable
+        'Categories': '',  # General Savings has no categories - it's calculated as remainder
+    },
+]
+
+
+def _safe_budget_filename(name: str) -> str:
+    cleaned = ''.join(c for c in name if c.isalnum() or c in {' ', '_', '-'})
+    cleaned = cleaned.strip().replace(' ', '_')
+    return cleaned or 'budget'
+
+
+def _escape_dollar_for_markdown(amount: float) -> str:
+    """Format a dollar amount and escape the dollar sign for markdown rendering.
+    
+    Args:
+        amount: The dollar amount to format
+        
+    Returns:
+        Formatted string with escaped dollar sign (e.g., "\\$1,234.56")
+    """
+    return f"${amount:,.2f}".replace("$", "\\$")
+
+
+def _budget_path(name: str) -> Path:
+    ensure_data_directories()
+    return BUDGETS_DIR / f"{_safe_budget_filename(name)}.json"
+
+
+def _categorize_expense(category_name: str) -> str:
+    """Categorize an expense category into 'Needs' or 'Wants' based on keywords.
+    
+    Args:
+        category_name: The category name to categorize
+        
+    Returns:
+        'Essentials (Needs)' or 'Lifestyle (Wants)'
+    """
+    cat_lower = category_name.lower()
+    
+    # Check for needs keywords
+    for keyword in NEEDS_KEYWORDS:
+        if keyword in cat_lower:
+            return 'Essentials (Needs)'
+    
+    # Check for wants keywords
+    for keyword in WANTS_KEYWORDS:
+        if keyword in cat_lower:
+            return 'Lifestyle (Wants)'
+    
+    # Default to Wants if unclear (better to over-budget wants than needs)
+    return 'Lifestyle (Wants)'
+
+
+def _get_default_envelopes_with_all_categories() -> List[Dict[str, Any]]:
+    """Get default envelopes with all categories from database assigned.
+    
+    Unassigned categories are distributed to Needs or Wants based on their names.
+    """
+    all_categories = set(_fetch_categories())
+    if not all_categories:
+        # No categories in database yet, return defaults as-is
+        return [dict(row) for row in DEFAULT_ENVELOPES]
+    
+    # Get categories already assigned in default envelopes
+    assigned_in_defaults = set()
+    default_envelopes = []
+    needs_env = None
+    wants_env = None
+    
+    for env in DEFAULT_ENVELOPES:
+        env_copy = dict(env)
+        if env['Group'] == 'Essentials (Needs)':
+            needs_env = env_copy
+            default_cats = [c.strip() for c in env.get('Categories', '').split(',') if c.strip()]
+            assigned_in_defaults.update(default_cats)
+            default_envelopes.append(env_copy)
+        elif env['Group'] == 'Lifestyle (Wants)':
+            wants_env = env_copy
+            default_cats = [c.strip() for c in env.get('Categories', '').split(',') if c.strip()]
+            assigned_in_defaults.update(default_cats)
+            default_envelopes.append(env_copy)
+        else:
+            # General Savings - no categories
+            default_envelopes.append(env_copy)
+    
+    # Find unassigned categories and distribute them
+    unassigned = all_categories - assigned_in_defaults
+    
+    if unassigned and needs_env and wants_env:
+        needs_cats = [c.strip() for c in needs_env.get('Categories', '').split(',') if c.strip()]
+        wants_cats = [c.strip() for c in wants_env.get('Categories', '').split(',') if c.strip()]
+        
+        for cat in sorted(unassigned):
+            target = _categorize_expense(cat)
+            if target == 'Essentials (Needs)':
+                needs_cats.append(cat)
+            else:
+                wants_cats.append(cat)
+        
+        needs_env['Categories'] = ', '.join(sorted(set(needs_cats)))
+        wants_env['Categories'] = ', '.join(sorted(set(wants_cats)))
+    
+    return default_envelopes
+
+
+def _normalize_envelope_config(entries: Any) -> List[Dict[str, Any]]:
+    """Normalize envelope configuration, ensuring Type field is present and all categories are assigned."""
+    if not isinstance(entries, list):
+        return _get_default_envelopes_with_all_categories()
+    
+    normalized = []
+    all_categories = set(_fetch_categories())
+    assigned_categories = set()
+    
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        # Determine type - default to expenses if not specified
+        envelope_type = row.get('Type') or row.get('type', ENVELOPE_TYPE_EXPENSES)
+        # If it's the savings group, ensure type is savings
+        if row.get('Group') == SAVINGS_GROUP_NAME:
+            envelope_type = ENVELOPE_TYPE_SAVINGS
+        
+        categories = row.get('Categories') or row.get('categories') or ''
+        cat_list = [c.strip() for c in categories.split(',') if c.strip()]
+        assigned_categories.update(cat_list)
+        
+        normalized.append({
+            'Group': row.get('Group') or row.get('group') or 'Envelope',
+            'Type': envelope_type,
+            'Target %': float(row.get('Target %', row.get('target_pct', 0.0))),
+            'Categories': categories,
+        })
+    
+    # If no valid entries, return defaults with all categories
+    if not normalized:
+        return _get_default_envelopes_with_all_categories()
+    
+    # Find unassigned categories and distribute them to Needs or Wants
+    unassigned = all_categories - assigned_categories
+    if unassigned:
+        needs_env = next((e for e in normalized if e.get('Group') == 'Essentials (Needs)'), None)
+        wants_env = next((e for e in normalized if e.get('Group') == 'Lifestyle (Wants)'), None)
+        
+        if needs_env and wants_env:
+            needs_cats = [c.strip() for c in needs_env.get('Categories', '').split(',') if c.strip()]
+            wants_cats = [c.strip() for c in wants_env.get('Categories', '').split(',') if c.strip()]
+            
+            for cat in sorted(unassigned):
+                target = _categorize_expense(cat)
+                if target == 'Essentials (Needs)':
+                    needs_cats.append(cat)
+                else:
+                    wants_cats.append(cat)
+            
+            needs_env['Categories'] = ', '.join(sorted(set(needs_cats)))
+            wants_env['Categories'] = ', '.join(sorted(set(wants_cats)))
+    
+    return normalized
+
+
+def _load_saved_budgets_from_disk() -> Dict[str, Dict[str, Any]]:
+    """Load all saved budgets from disk.
+    
+    Returns:
+        Dictionary mapping budget names to their full configuration including
+        budgets, envelopes, targets, groups, and metadata.
+    """
+    ensure_data_directories()
+    budgets: Dict[str, Dict[str, Any]] = {}
+    if not BUDGETS_DIR.exists():
+        return budgets
+    
+    for path in BUDGETS_DIR.glob('*.json'):
+        try:
+            with path.open('r', encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as e:
+            # Log error but continue processing other files
+            # Only show warning if streamlit is available (in page context)
+            try:
+                st.warning(f"Failed to load budget file {path.name}: {e}")
+            except (AttributeError, RuntimeError):
+                # Not in streamlit context, just skip
+                pass
+            continue
+        
+        if not isinstance(data, dict):
+            continue
+            
+        # Extract name - use filename as fallback
+        name = data.get('name') or path.stem
+        if not name:
+            continue
+        
+        # Extract budgets - handle missing, None, or empty dict
+        entries = data.get('budgets')
+        if entries is None:
+            entries = {}
+        elif not isinstance(entries, dict):
+            # Invalid format - skip this file
+            continue
+        
+        # Preserve all budget values including 0.0 (don't filter falsy values)
+        # Only filter out None values and ensure numeric conversion
+        budget_dict = {}
+        for k, v in entries.items():
+            if v is not None:
+                try:
+                    budget_dict[k] = float(v)
+                except (ValueError, TypeError):
+                    # Skip invalid numeric values
+                    continue
+        
+        # Extract and normalize envelopes
+        envelopes = _normalize_envelope_config(data.get('envelopes'))
+        
+        # Build complete budget entry
+        budgets[name] = {
+            'name': name,
+            'budgets': budget_dict,
+            'envelopes': envelopes,
+            'targets': _targets_from_envelopes(envelopes),
+            'groups': _groups_from_envelopes(envelopes),
+            'saved_at': data.get('saved_at'),
+            'version': data.get('version', 1),
+        }
+    
+    return budgets
+
+
+def _save_budget_to_disk(name: str, budgets: Dict[str, float], envelopes: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Save a budget to disk.
+    
+    Args:
+        name: Budget name (will be sanitized for filename)
+        budgets: Dictionary mapping category names to monthly budget amounts
+        envelopes: Optional envelope configuration. If None, uses session state.
+    
+    Raises:
+        OSError: If file cannot be written
+        ValueError: If name is empty after sanitization
+    """
+    if not name or not name.strip():
+        raise ValueError("Budget name cannot be empty")
+    
+    ensure_data_directories()
+    
+    # Get envelope config from parameter or session state
+    if envelopes is None:
+        envelopes = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+    
+    normalized_env = _normalize_envelope_config(envelopes)
+    
+    # Ensure all budget values are floats (preserve 0.0 values)
+    normalized_budgets = {}
+    for k, v in budgets.items():
+        if k:  # Skip empty category names
+            try:
+                normalized_budgets[k] = float(v) if v is not None else 0.0
+            except (ValueError, TypeError):
+                # Skip invalid values
+                continue
+    
+    payload = {
+        'name': name.strip(),
+        'budgets': normalized_budgets,
+        'envelopes': normalized_env,
+        'targets': _targets_from_envelopes(normalized_env),
+        'groups': _groups_from_envelopes(normalized_env),
+        'saved_at': datetime.utcnow().isoformat(),
+        'version': 1,
+    }
+    
+    target = _budget_path(name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        with target.open('w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+    except OSError as e:
+        raise OSError(f"Failed to save budget to {target}: {e}") from e
+
+
+def _delete_budget_from_disk(name: str) -> None:
+    """Delete a budget file from disk.
+    
+    Args:
+        name: Budget name (will be sanitized for filename lookup)
+    
+    Raises:
+        OSError: If file cannot be deleted (file not found is silently ignored)
+    """
+    if not name or not name.strip():
+        raise ValueError("Budget name cannot be empty")
+    
+    target = _budget_path(name)
+    if not target.exists():
+        # File doesn't exist - not an error, just return
+        return
+    
+    try:
+        target.unlink()
+    except OSError as e:
+        # Re-raise with more context
+        raise OSError(f"Failed to delete budget file {target}: {e}") from e
+
+
+def main() -> None:
+    st.set_page_config(page_title="Budgets", page_icon="📋", layout="wide")
+    sidebar = render_shared_sidebar()
+    base_df = sidebar['base_df']
+    filters = sidebar['filters']
+    filtered_df = apply_filters(base_df, filters) if not base_df.empty else pd.DataFrame()
+    analytics = PersonalFinanceAnalytics(filtered_df) if not filtered_df.empty else None
+
+    budgets = st.session_state.setdefault('budgets', {})
+    envelope_config = st.session_state.setdefault('envelope_groups_config', [dict(row) for row in DEFAULT_ENVELOPES])
+    saved_budgets = _load_saved_budgets_from_disk()
+    saved_names = sorted(saved_budgets.keys())
+    
+    # Determine selected budget name
+    selected_budget_name = st.session_state.get('selected_budget_name', '')
+    if selected_budget_name and selected_budget_name not in saved_budgets:
+        # Selected budget no longer exists (was deleted), clear selection
+        selected_budget_name = ''
+        st.session_state.selected_budget_name = ''
+    
+    # Auto-select first saved budget if none selected
+    if not selected_budget_name and saved_names:
+        selected_budget_name = saved_names[0]
+        st.session_state.selected_budget_name = selected_budget_name
+    
+    # Auto-load selected budget into session state if not already loaded
+    # Load even if empty - we'll show guidance in the UI
+    if selected_budget_name and selected_budget_name in saved_budgets:
+        payload = saved_budgets[selected_budget_name]
+        if isinstance(payload, dict):
+            saved_budget = payload.get('budgets', {})
+            if isinstance(saved_budget, dict):
+                # Load budget values (even if empty) - normalize to floats
+                normalized_budget = {k: float(v) for k, v in saved_budget.items() if k and v is not None}
+                # Only update if session state budgets are empty or different
+                if not budgets or budgets != normalized_budget:
+                    budgets = normalized_budget
+                    st.session_state.budgets = budgets
+            
+            # Load envelope configuration if available
+            saved_envelopes = payload.get('envelopes', [])
+            if saved_envelopes:
+                envelope_config = _ensure_savings_entry(saved_envelopes)
+                st.session_state.envelope_groups_config = envelope_config
+    st.header("📋 Budget Command Center")
+    _render_metrics(budgets, analytics)
+
+    analytics_tab, manage_tab, insights_tab = st.tabs([
+        "📊 Analysis",
+        "🛠 Manage Budgets",
+        "📈 Budget Insights",
+    ])
+
+    with analytics_tab:
+        _render_percent_income_analysis(analytics)
+
+    with manage_tab:
+        # Show budget name input at top (no save button here)
+        budget_name_input = _render_budget_name_input()
+        st.divider()
+        _render_unified_budget_system(budgets, envelope_config, analytics, budget_name_input, saved_budgets)
+        st.divider()
+        # Delete section at bottom
+        saved_budgets = _render_delete_budget_section(saved_budgets)
+
+    with insights_tab:
+        selected_budget_name, selected_budget = _render_budget_selector(saved_budgets, selected_budget_name, current_budget=budgets)
+        # Fallback: if selector returned empty budget but we have a selected name, try to load it
+        if selected_budget_name and selected_budget_name != 'Current (unsaved)' and not selected_budget:
+            payload = saved_budgets.get(selected_budget_name, {})
+            if isinstance(payload, dict):
+                selected_budget = payload.get('budgets', {})
+                if not isinstance(selected_budget, dict):
+                    selected_budget = {}
+                else:
+                    # Ensure budget values are floats
+                    selected_budget = {k: float(v) for k, v in selected_budget.items() if k and v is not None}
+                
+                # Update session state
+                st.session_state.budgets = selected_budget
+                
+                # Load envelope configuration
+                envelopes = payload.get('envelopes', [])
+            if envelopes:
+                st.session_state.envelope_groups_config = _ensure_savings_entry(envelopes)
+        _render_budget_insights(selected_budget, analytics, selected_budget_name)
+
+
+def _render_metrics(budgets: Dict[str, float], analytics: Optional[PersonalFinanceAnalytics]) -> None:
+    if not budgets or analytics is None:
+        st.info("Create a budget and load transactions to unlock analytics.")
+        return
+    performance = analytics.calculate_budget_performance(budgets)
+    total_budget = sum(budgets.values())
+    total_actual = performance['Actual'].sum() if not performance.empty else 0.0
+    variance = total_budget - total_actual
+    overspent_count = int((performance['Status'] == 'Over Budget').sum())
+    cols = st.columns(4)
+    cols[0].metric("Budgeted", f"${total_budget:,.2f}")
+    cols[1].metric("Actual", f"${total_actual:,.2f}")
+    cols[2].metric("Variance", f"${variance:,.2f}", delta_color="inverse")
+    cols[3].metric("Categories over budget", overspent_count)
+
+
+def _render_percent_income_analysis(analytics: Optional[PersonalFinanceAnalytics]) -> None:
+    st.subheader("Percent of income by category")
+    if analytics is None or analytics.data.empty:
+        st.info("Load transactions to estimate category share of income.")
+        return
+    incomes = _income_series_complete(analytics)
+    if incomes.empty:
+        st.info("Need historical income to compute percentages.")
+        return
+    latest_month = incomes.index.max()
+    last_three = incomes.tail(3)
+    latest_value = float(last_three.iloc[-1]) if not last_three.empty else 0.0
+    avg_last_three = float(last_three.mean()) if not last_three.empty else latest_value
+    avg_all = float(incomes.mean())
+
+    cols = st.columns(3)
+    cols[0].metric("Most recent month", f"${latest_value:,.2f}")
+    cols[1].metric("3-month avg", f"${avg_last_three:,.2f}")
+    cols[2].metric("All-time avg", f"${avg_all:,.2f}")
+
+    df = _category_percent_income(analytics, incomes)
+    if df.empty:
+        st.info("Need at least one complete month of income and expense data.")
+        return
+    months = sorted(df['Month'].unique())
+    last_months = months[-3:]
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption("Last 3 complete months")
+        summary_recent = _percent_income_summary(df[df['Month'].isin(last_months)], incomes)
+        if summary_recent.empty:
+            st.info("Not enough complete months yet.")
+        else:
+            st.dataframe(
+                summary_recent.style.format({'Amount': '${:,.0f}', 'Percent': '{:,.1f}%'}),
+                use_container_width=True,
+                hide_index=True,
+            )
+    with col2:
+        st.caption("All-time average")
+        summary_all = _percent_income_summary(df, incomes)
+        st.dataframe(
+            summary_all.style.format({'Amount': '${:,.0f}', 'Percent': '{:,.1f}%'}),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.caption("Top categories over the last 3 months")
+    chart_df = summary_recent.head(10) if not summary_recent.empty else summary_all.head(10)
+    if not chart_df.empty:
+        fig = px.bar(
+            chart_df,
+            x='Category',
+            y='Percent',
+            text=chart_df['Amount'].apply(lambda x: f"${x:,.0f}"),
+            title='Share of income',
+            labels={'Percent': '% of income'}
+        )
+        fig.update_layout(yaxis_tickformat='.1f%%', uniformtext_minsize=10, uniformtext_mode='hide')
+        fig.update_traces(textposition='outside')
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_budget_name_input() -> str:
+    """Render budget name input field.
+    
+    Returns:
+        The budget name entered by the user
+    """
+    st.subheader("Budget Name")
+    current_name = st.session_state.get('selected_budget_name', 'My Budget')
+    if current_name and current_name in _load_saved_budgets_from_disk():
+        default_name = current_name
+    else:
+        default_name = "My Budget"
+    
+    budget_name = st.text_input(
+        "Name for this budget",
+        value=default_name,
+        key='save_budget_name',
+        help="Enter a name to save your budget configuration"
+    )
+    return budget_name.strip() if budget_name else "My Budget"
+
+
+def _render_delete_budget_section(saved: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Render delete budget section at the bottom.
+    
+    Returns:
+        Updated dictionary of saved budgets (reloaded after delete operations)
+    """
+    st.subheader("🗑️ Delete Saved Budgets")
+    if not saved:
+        st.info("No saved budgets to delete.")
+        return saved
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        to_delete = st.selectbox(
+            "Select a budget to delete",
+            options=["(none)"] + sorted(saved.keys()),
+            index=0,
+            key='delete_budget_select',
+            help="Choose a saved budget to permanently delete"
+        )
+    with col2:
+        if st.button("Delete", key='delete_budget_button', type="secondary", use_container_width=True):
+            if to_delete != "(none)":
+                try:
+                    _delete_budget_from_disk(to_delete)
+                    if st.session_state.get('selected_budget_name') == to_delete:
+                        st.session_state.selected_budget_name = ''
+                        st.session_state.budgets = {}
+                    saved = _load_saved_budgets_from_disk()
+                    st.warning(f"🗑️ Deleted budget '{to_delete}'")
+                    st.rerun()
+                except OSError as e:
+                    st.error(f"Failed to delete budget: {e}")
+    
+    return saved
+
+
+def _render_budget_selector(saved: Dict[str, Dict[str, Any]], selected_name: str, current_budget: Dict[str, float]) -> tuple[str, Dict[str, float]]:
+    """Render budget selector and load selected budget into session state.
+    
+    Args:
+        saved: Dictionary of saved budgets from disk
+        selected_name: Currently selected budget name
+        current_budget: Current unsaved budget from session state
+    
+    Returns:
+        Tuple of (selected_name, budget_dict)
+    """
+    st.subheader("Select budget for insights")
+    
+    # Build options with indicators for empty budgets
+    options = []
+    option_labels = []
+    
+    if current_budget:
+        options.append('Current (unsaved)')
+        budget_count = len(current_budget)
+        label = f"Current (unsaved)" + (f" - {budget_count} categories" if budget_count > 0 else " - empty")
+        option_labels.append(label)
+    
+    for name in sorted(saved.keys()):
+        options.append(name)
+        payload = saved.get(name, {})
+        budget_dict = payload.get('budgets', {}) if isinstance(payload, dict) else {}
+        budget_count = len(budget_dict) if isinstance(budget_dict, dict) else 0
+        label = name + (f" - {budget_count} categories" if budget_count > 0 else " - empty")
+        option_labels.append(label)
+    
+    if not options:
+        st.info("No budgets available. Create and save one in the **🛠 Manage Budgets** tab.")
+        return '', {}
+    
+    # Determine default index
+    default_index = 0
+    if selected_name:
+        if selected_name in options:
+            default_index = options.index(selected_name)
+        elif selected_name == 'Current (unsaved)' and 'Current (unsaved)' in options:
+            default_index = 0
+    
+    # Use the actual option names for the selectbox, but show labels
+    chosen = st.selectbox("Budgets", options=options, index=default_index, key='budget_selector', format_func=lambda x: option_labels[options.index(x)] if x in options else x)
+    
+    if chosen == 'Current (unsaved)':
+        budget = dict(current_budget)
+        st.session_state.selected_budget_name = ''
+    else:
+        # Load from saved budgets
+        payload = saved.get(chosen, {})
+        if not isinstance(payload, dict):
+            st.error(f"Invalid budget data for '{chosen}'")
+            return '', {}
+        
+        budget = payload.get('budgets', {})
+        if not isinstance(budget, dict):
+            budget = {}
+        
+        # Ensure budget values are floats
+        budget = {k: float(v) for k, v in budget.items() if k and v is not None}
+        
+        # Show status
+        if not budget:
+            st.info(f"📋 **{chosen}** is loaded but has no budget amounts. Go to **🛠 Manage Budgets** to add budget amounts.")
+        else:
+            st.success(f"✅ Loaded **{chosen}** with {len(budget)} budget category(ies)")
+        
+        # Load envelope configuration
+        envelopes = payload.get('envelopes', [])
+        if envelopes:
+            st.session_state.envelope_groups_config = _ensure_savings_entry(envelopes)
+        
+        # Update session state
+        st.session_state.budgets = budget
+        st.session_state.selected_budget_name = chosen
+    
+    return chosen, budget
+
+
+def _render_envelope_editor(envelope_config: List[Dict[str, str]], analytics: Optional[PersonalFinanceAnalytics]) -> None:
+    st.subheader("Envelope settings")
+    st.caption("Configure envelope groups and their target percentages of income. Categories are assigned to envelopes for budget organization.")
+    config = _ensure_savings_entry(envelope_config)
+    income_avg = _three_month_avg_income(analytics)
+    categories = sorted(set(_fetch_categories() + list(st.session_state.budgets.keys())))
+
+    if income_avg > 0:
+        income_display = _escape_dollar_for_markdown(income_avg)
+        st.info(f"💡 Based on 3-month average income of **{income_display}**, percentages will convert to dollar amounts automatically.")
+
+    if st.button("➕ Add envelope group", help="Create a new envelope to allocate income"):
+        non_savings = [row for row in config if row.get('Group') != SAVINGS_GROUP_NAME]
+        savings = next(row for row in config if row.get('Group') == SAVINGS_GROUP_NAME)
+        non_savings.append({
+            'Group': f"Envelope {len(non_savings)+1}", 
+            'Type': ENVELOPE_TYPE_EXPENSES,
+            'Target %': 0.0, 
+            'Categories': ''
+        })
+        st.session_state.envelope_groups_config = _finalize_envelope_config(non_savings, savings)
+        st.rerun()
+
+    updated_entries: List[Dict[str, str]] = []
+    # Separate expenses and savings envelopes
+    expenses_envelopes = [row for row in config if row.get('Type', ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES and row.get('Group') != SAVINGS_GROUP_NAME]
+    savings_envelopes = [row for row in config if row.get('Type') == ENVELOPE_TYPE_SAVINGS and row.get('Group') != SAVINGS_GROUP_NAME]
+    savings_row = next((row for row in config if row.get('Group') == SAVINGS_GROUP_NAME), None)
+    
+    # Edit expenses envelopes
+    st.markdown("#### Expenses Envelopes")
+    st.caption("These envelopes allocate income for expenses. The remaining income will automatically go to General Savings.")
+    
+    for idx, row in enumerate(expenses_envelopes):
+        with st.expander(row.get('Group') or f"Envelope {idx+1}", expanded=False):
+            name = st.text_input("Name", value=row.get('Group', ''), key=f"env_name_{idx}")
+            
+            envelope_type = st.selectbox(
+                "Type",
+                options=[ENVELOPE_TYPE_EXPENSES, ENVELOPE_TYPE_SAVINGS],
+                index=0 if row.get('Type', ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES else 1,
+                key=f"env_type_{idx}",
+                help="Expenses: counts toward allocation. Savings: special category for later analytics."
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if envelope_type == ENVELOPE_TYPE_EXPENSES:
+                    target = st.number_input(
+                        "Target % of income",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(row.get('Target %', 0.0)),
+                        step=0.5,
+                        key=f"env_target_{idx}",
+                        help="Percentage of monthly income to allocate to this envelope"
+                    )
+                else:
+                    # Savings envelopes don't have editable Target %
+                    st.caption("Target %: Auto-calculated (savings envelopes)")
+                    target = 0.0
+            with col2:
+                if income_avg > 0 and envelope_type == ENVELOPE_TYPE_EXPENSES:
+                    target_dollars = (target / 100.0) * income_avg
+                    st.metric("Target Amount", f"${target_dollars:,.2f}")
+                elif income_avg > 0:
+                    st.caption("Savings envelopes are calculated automatically")
+                else:
+                    st.caption("Income data needed for dollar conversion")
+            
+            default_categories = [c.strip() for c in row.get('Categories', '').split(',') if c.strip()]
+            missing_defaults = [c for c in default_categories if c not in categories]
+            option_list = sorted(set(categories + missing_defaults))
+            default_categories = [c for c in default_categories if c in option_list]
+            selected = st.multiselect(
+                "Categories",
+                options=option_list,
+                default=default_categories,
+                key=f"env_cats_{idx}",
+                help="Select which expense categories belong to this envelope"
+            )
+            remove = st.button("Remove envelope", key=f"env_remove_{idx}")
+            if remove:
+                continue
+            updated_entries.append({
+                'Group': name.strip() or f"Envelope {idx+1}",
+                'Type': envelope_type,
+                'Target %': max(0.0, min(100.0, target)) if envelope_type == ENVELOPE_TYPE_EXPENSES else 0.0,
+                'Categories': ', '.join(selected)
+            })
+    
+    # Edit other savings envelopes (besides General Savings)
+    if savings_envelopes:
+        st.markdown("#### Savings Envelopes")
+        st.caption("Special envelopes for savings goals. These don't count toward expense allocation.")
+        for idx, row in enumerate(savings_envelopes):
+            with st.expander(row.get('Group') or f"Savings {idx+1}", expanded=False):
+                name = st.text_input("Name", value=row.get('Group', ''), key=f"savings_name_{idx}")
+                st.caption("Type: Savings (auto-calculated, not included in expense allocation)")
+                
+                default_categories = [c.strip() for c in row.get('Categories', '').split(',') if c.strip()]
+                missing_defaults = [c for c in default_categories if c not in categories]
+                option_list = sorted(set(categories + missing_defaults))
+                default_categories = [c for c in default_categories if c in option_list]
+                selected = st.multiselect(
+                    "Categories",
+                    options=option_list,
+                    default=default_categories,
+                    key=f"savings_cats_{idx}",
+                    help="Select which savings categories belong to this envelope"
+                )
+                remove = st.button("Remove envelope", key=f"savings_remove_{idx}")
+                if remove:
+                    continue
+                updated_entries.append({
+                    'Group': name.strip() or f"Savings {idx+1}",
+                    'Type': ENVELOPE_TYPE_SAVINGS,
+                    'Target %': 0.0,  # Savings envelopes don't have editable Target %
+                'Categories': ', '.join(selected)
+            })
+
+    final_config = _finalize_envelope_config(updated_entries, savings_row)
+    savings_target = final_config[-1]['Target %'] if final_config else 0.0
+    
+    # Show summary - only count expenses envelopes
+    expenses_pct = sum(
+        float(row.get('Target %', 0.0)) 
+        for row in final_config 
+        if row.get('Type', ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES
+    )
+    
+    # Show General Savings separately
+    st.markdown("#### General Savings")
+    if savings_row:
+        savings_categories = [c.strip() for c in savings_row.get('Categories', '').split(',') if c.strip()]
+        st.info(f"""
+        **{SAVINGS_GROUP_NAME}** (Auto-calculated, not editable)
+        - **Allocation**: {savings_target:.1f}% of income (${(savings_target / 100.0) * income_avg:,.2f} if income data available)
+        - **Categories**: {', '.join(savings_categories[:5])}{'...' if len(savings_categories) > 5 else ''}
+        - This represents the **remaining unallocated income** after all expense envelopes
+        """)
+    
+    if income_avg > 0:
+        expenses_dollars = (expenses_pct / 100.0) * income_avg
+        savings_dollars = (savings_target / 100.0) * income_avg
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Expenses Allocated", f"{expenses_pct:.1f}%", f"${expenses_dollars:,.2f}")
+        with col2:
+            st.metric(f"{SAVINGS_GROUP_NAME}", f"{savings_target:.1f}%", f"${savings_dollars:,.2f}")
+        with col3:
+            total_pct = expenses_pct + savings_target
+            if expenses_pct > 100.01:
+                st.error(f"⚠️ Expenses over 100% ({expenses_pct:.1f}%)")
+            elif abs(total_pct - 100.0) < 0.01:
+                st.success("✅ 100% allocated")
+            else:
+                st.info(f"Total: {total_pct:.1f}%")
+    
+    st.markdown(f"<small>💡 {SAVINGS_GROUP_NAME} automatically receives the remainder ({savings_target:.1f}%) after all expense envelopes are allocated.</small>", unsafe_allow_html=True)
+
+    _render_envelope_breakdown(final_config, income_avg)
+
+    if st.button("Save envelope settings"):
+        if income_avg > 0 and expenses_pct > 100.01:
+            st.error(f"⚠️ Expenses allocation exceeds 100% ({expenses_pct:.1f}%). Please adjust percentages.")
+        else:
+            st.session_state.envelope_groups_config = final_config
+            st.success("Envelope configuration updated.")
+            st.rerun()
+
+
+def _render_envelope_breakdown(config: List[Dict[str, str]], income_avg: float = 0.0) -> None:
+    if not config:
+        return
+    df = pd.DataFrame(config)
+    if 'Target %' not in df:
+        return
+    df['Target %'] = pd.to_numeric(df['Target %'], errors='coerce').fillna(0.0)
+    if df['Target %'].sum() == 0:
+        st.caption("Set target percentages to visualize envelope allocation.")
+        return
+    if income_avg and income_avg > 0:
+        df['Target ($)'] = (df['Target %'] / 100.0) * income_avg
+    col = st.columns(2)
+    with col[0]:
+        st.caption("Envelope allocation")
+        fig = px.pie(df, names='Group', values='Target %')
+        st.plotly_chart(fig, use_container_width=True)
+    with col[1]:
+        st.caption("Targets")
+        display_cols = ['Group', 'Target %'] + (['Target ($)'] if 'Target ($)' in df else [])
+        st.dataframe(
+            df[display_cols].style.format({'Target %': '{:,.1f}%', 'Target ($)': '${:,.0f}'}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def _budget_performance_snapshot(analytics: Optional[PersonalFinanceAnalytics], budgets: Dict[str, float], *, current_only: bool) -> tuple[pd.DataFrame, str | int]:
+    if analytics is None or not budgets or analytics.data.empty:
+        return pd.DataFrame(), ''
+    df = analytics.data.copy()
+    if df.empty:
+        return pd.DataFrame(), ''
+    df['Month'] = df['Transaction Date'].dt.to_period('M')
+    months = sorted(df['Month'].unique())
+    if not months:
+        return pd.DataFrame(), ''
+    target_months = {months[-1]} if current_only else set(months)
+    scoped = df[df['Month'].isin(target_months)]
+    months_count = scoped['Month'].nunique()
+    if months_count == 0:
+        return pd.DataFrame(), ''
+    expense = analytics._expense_rows(scoped)
+    if expense.empty:
+        return pd.DataFrame(), months_count if not current_only else str(months[-1])
+    expense['AbsAmount'] = expense['Amount'].abs()
+    grouped = expense.groupby('Category')['AbsAmount'].sum()
+
+    rows = []
+    for category, budget in budgets.items():
+        target_total = budget * months_count
+        actual_total = grouped.get(category, 0.0)
+        actual_per_month = actual_total / months_count if months_count else 0.0
+        variance_total = target_total - actual_total
+        variance_monthly = budget - actual_per_month
+        percent_used = (actual_total / target_total * 100.0) if target_total else None
+        status = 'Over' if variance_total < 0 else 'Under'
+        rows.append({
+            'Category': category,
+            'Budget/mo': budget,
+            'Actual/mo': actual_per_month,
+            'Variance/mo': variance_monthly,
+            'Target Total': target_total,
+            'Actual Total': actual_total,
+            'Variance Total': variance_total,
+            'Percent Used': percent_used,
+            'Status': status,
+        })
+    result = pd.DataFrame(rows)
+    label = str(months[-1]) if current_only else months_count
+    return result, label
+
+
+def _render_perf_table(perf_df: pd.DataFrame) -> None:
+    if perf_df.empty:
+        st.info("No budget performance data for this period.")
+        return
+    display = perf_df[['Category', 'Budget/mo', 'Actual/mo', 'Variance/mo', 'Percent Used', 'Status']].copy()
+    display['Percent Used'] = display['Percent Used'].fillna(0).round(1)
+    st.dataframe(
+        display.style.format({
+            'Budget/mo': '${:,.0f}',
+            'Actual/mo': '${:,.0f}',
+            'Variance/mo': '${:,.0f}',
+            'Percent Used': '{:,.1f}%'
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _render_perf_chart(perf_df: pd.DataFrame, *, title: str, use_total: bool = False) -> None:
+    if perf_df.empty:
+        return
+    x = perf_df['Category']
+    budget_vals = perf_df['Target Total'] if use_total else perf_df['Budget/mo']
+    actual_vals = perf_df['Actual Total'] if use_total else perf_df['Actual/mo']
+    fig = go.Figure()
+    fig.add_bar(name='Budget', x=x, y=budget_vals, marker_color='#1f77b4')
+    fig.add_bar(name='Actual', x=x, y=actual_vals, marker_color='#ff7f0e')
+    fig.update_layout(title=title, barmode='group', xaxis_tickangle=-30, margin=dict(l=10, r=10, t=40, b=40))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_variance_focus(perf_df: pd.DataFrame) -> None:
+    if perf_df.empty:
+        st.info("No variance to highlight.")
+        return
+    sorted_df = perf_df.sort_values('Variance Total')
+    over = sorted_df[sorted_df['Variance Total'] < 0].head(5)
+    under = sorted_df[sorted_df['Variance Total'] >= 0].tail(5)
+    cols = st.columns(2)
+    with cols[0]:
+        st.caption("Top overspend")
+        if over.empty:
+            st.success("No overspending in this period.")
+        else:
+            st.dataframe(
+                over[['Category', 'Variance Total', 'Percent Used']].style.format({'Variance Total': '${:,.0f}', 'Percent Used': '{:,.1f}%'}),
+                use_container_width=True,
+                hide_index=True,
+            )
+    with cols[1]:
+        st.caption("Top underspend")
+        if under.empty:
+            st.info("No underspend categories.")
+        else:
+            st.dataframe(
+                under[['Category', 'Variance Total', 'Percent Used']].style.format({'Variance Total': '${:,.0f}', 'Percent Used': '{:,.1f}%'}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+def _render_unified_budget_system(budgets: Dict[str, float], envelope_config: List[Dict[str, Any]], analytics: Optional[PersonalFinanceAnalytics], budget_name: str, saved_budgets: Dict[str, Dict[str, Any]]) -> None:
+    """Unified interface combining envelope settings and budget editor."""
+    st.header("📝 Budget Planning")
+    
+    # Get income estimate
+    income_estimate = _three_month_avg_income(analytics)
+    
+    # Income summary at top
+    if income_estimate > 0:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Monthly Income", f"${income_estimate:,.2f}", help="3-month average")
+        total_budget = sum(budgets.values()) if budgets else 0.0
+        budget_pct = (total_budget / income_estimate * 100) if income_estimate > 0 else 0.0
+        with col2:
+            st.metric("Budgeted", f"${total_budget:,.2f}", delta=f"{budget_pct:.1f}%", help="Total budgeted expenses")
+        remaining = income_estimate - total_budget
+        remaining_pct = (remaining / income_estimate * 100) if income_estimate > 0 else 0.0
+        with col3:
+            st.metric("Remaining", f"${remaining:,.2f}", delta=f"{remaining_pct:.1f}%", help="Available for savings")
+        with col4:
+            expenses_pct = sum(
+                float(row.get('Target %', 0.0))
+                for row in envelope_config
+                if row.get('Type', ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES
+            )
+            savings_pct = 100.0 - expenses_pct
+            st.metric("Savings Target", f"{savings_pct:.1f}%", f"${(savings_pct/100)*income_estimate:,.2f}", help="Auto-calculated from envelope allocation")
+    else:
+        st.warning("⚠️ No income data available. Upload transaction data with income to enable percentage-based budgeting.")
+    
+    # Mode selector
+    view_mode = st.radio(
+        "View Mode",
+        options=["Envelope View", "Category View"],
+        horizontal=True,
+        help="Envelope View: Quick setup by groups. Category View: Detailed control per category."
+    )
+    
+    if view_mode == "Envelope View":
+        _render_unified_envelope_view(budgets, envelope_config, analytics, income_estimate, budget_name, saved_budgets)
+    else:
+        _render_detailed_budget_editor(budgets, _current_envelope_groups(), _current_target_map(), analytics, income_estimate, budget_name, saved_budgets)
+        if st.button("🧹 Clear all budgets"):
+            st.session_state.budgets = {}
+            st.warning("Budgets cleared.")
+            st.rerun()
+
+
+def _render_unified_envelope_view(budgets: Dict[str, float], envelope_config: List[Dict[str, Any]], analytics: Optional[PersonalFinanceAnalytics], income_estimate: float, budget_name: str, saved_budgets: Dict[str, Dict[str, Any]]) -> None:
+    """Unified view showing envelope configuration and budget setting together."""
+    config = _ensure_savings_entry(envelope_config)
+    all_categories = sorted(set(_fetch_categories() + list(st.session_state.budgets.keys())))
+    groups = _groups_from_envelopes(config)
+    targets = _targets_from_envelopes(config)
+    group_budgets = _aggregate_budgets_by_group(budgets, groups)
+    
+    # Separate expenses and savings
+    expenses_envelopes = [row for row in config if row.get('Type', ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES and row.get('Group') != SAVINGS_GROUP_NAME]
+    savings_row = next((row for row in config if row.get('Group') == SAVINGS_GROUP_NAME), None)
+    
+    # Check for unassigned categories
+    assigned_categories = set()
+    for row in config:
+        cats = [c.strip() for c in row.get('Categories', '').split(',') if c.strip()]
+        assigned_categories.update(cats)
+    
+    unassigned_categories = [c for c in all_categories if c not in assigned_categories]
+    if unassigned_categories:
+        st.warning(f"⚠️ {len(unassigned_categories)} unassigned category(ies): {', '.join(unassigned_categories[:10])}{'...' if len(unassigned_categories) > 10 else ''}. Please assign all categories to envelopes below.")
+    
+    st.markdown("### Configure Envelopes & Set Budgets")
+    st.caption("Configure your envelope groups and set budget amounts all in one place. Changes to envelope percentages automatically update budget suggestions.")
+    
+    # Add envelope button
+    col_add, col_info = st.columns([1, 4])
+    with col_add:
+        if st.button("➕ Add Envelope", use_container_width=True):
+            non_savings = [row for row in config if row.get('Group') != SAVINGS_GROUP_NAME]
+            savings = next(row for row in config if row.get('Group') == SAVINGS_GROUP_NAME)
+            non_savings.append({
+                'Group': f"Envelope {len(non_savings)+1}", 
+                'Type': ENVELOPE_TYPE_EXPENSES,
+                'Target %': 0.0, 
+                'Categories': ''
+            })
+            st.session_state.envelope_groups_config = _finalize_envelope_config(non_savings, savings)
+            st.rerun()
+    with col_info:
+        if income_estimate > 0:
+            # Escape dollar sign to prevent markdown/LaTeX interpretation
+            income_str = f"&#36;{income_estimate:,.2f}"
+            st.markdown(f"<small>💡 Set budget as percentage of income ({income_str} monthly). Dollar amounts are calculated automatically.</small>", unsafe_allow_html=True)
+        else:
+            st.caption("⚠️ No income data available. Upload transaction data to enable percentage-based budgeting.")
+    
+    updated_entries = []
+    
+    # Render each expenses envelope with integrated budget setting
+    for idx, row in enumerate(expenses_envelopes):
+        envelope_name = row.get('Group', f"Envelope {idx+1}")
+        current_target_pct = float(row.get('Target %', 0.0))
+        
+        with st.container():
+            # Envelope header with budget summary
+            col_header1, col_header2, col_header3 = st.columns([3, 2, 1])
+            with col_header1:
+                name = st.text_input("Envelope Name", value=envelope_name, key=f"env_name_{idx}", label_visibility="collapsed")
+            with col_header2:
+                if income_estimate > 0:
+                    target_pct = st.number_input(
+                        "Budget % of Income",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=current_target_pct,
+                        step=0.5,
+                        key=f"env_target_{idx}",
+                        help="Percentage of monthly income to budget for this envelope",
+                        label_visibility="collapsed"
+                    )
+                    target_dollars = (target_pct / 100.0) * income_estimate
+                else:
+                    target_pct = current_target_pct
+                    target_dollars = 0.0
+                    st.caption("No income data")
+            with col_header3:
+                if st.button("🗑️", key=f"env_remove_{idx}", help="Remove envelope"):
+                    continue
+            
+            # Show calculated dollar amount
+            if income_estimate > 0 and target_pct > 0:
+                # Escape dollar signs to prevent markdown/LaTeX interpretation
+                dollar_str = f"&#36;{target_dollars:,.2f}"
+                income_str = f"&#36;{income_estimate:,.2f}"
+                st.markdown(f"<small>💵 {dollar_str} per month (calculated from {target_pct:.1f}% of {income_str} income)</small>", unsafe_allow_html=True)
+            
+            # Category selection
+            default_categories = [c.strip() for c in row.get('Categories', '').split(',') if c.strip()]
+            missing_defaults = [c for c in default_categories if c not in all_categories]
+            option_list = sorted(set(all_categories + missing_defaults))
+            default_categories = [c for c in default_categories if c in option_list]
+            
+            # Highlight unassigned categories
+            unassigned_in_options = [c for c in option_list if c in unassigned_categories]
+            selected_categories = st.multiselect(
+                f"Categories for {name}",
+                options=option_list,
+                default=default_categories,
+                key=f"env_cats_{idx}",
+                help="Select expense categories that belong to this envelope. Unassigned categories should be assigned."
+            )
+            
+            # Show indicator if this envelope has unassigned categories
+            if unassigned_in_options and any(c in selected_categories for c in unassigned_in_options):
+                st.caption(f"✅ Assigning {len([c for c in selected_categories if c in unassigned_in_options])} previously unassigned category(ies)")
+            
+            st.divider()
+            
+            updated_entries.append({
+                'Group': name.strip() or f"Envelope {idx+1}",
+                'Type': ENVELOPE_TYPE_EXPENSES,
+                'Target %': target_pct,
+                'Categories': ', '.join(selected_categories)
+            })
+    
+    # Show General Savings (read-only)
+    if savings_row:
+        savings_target = _finalize_envelope_config(updated_entries, savings_row)[-1]['Target %']
+        st.markdown("### 💾 General Savings")
+        savings_categories = [c.strip() for c in savings_row.get('Categories', '').split(',') if c.strip()]
+        col_sav1, col_sav2 = st.columns([1, 2])
+        with col_sav1:
+            if income_estimate > 0:
+                savings_dollars = (savings_target / 100.0) * income_estimate
+                st.metric("Auto-Allocated", f"{savings_target:.1f}%", f"${savings_dollars:,.2f}")
+            else:
+                st.metric("Auto-Allocated", "N/A", "No income data")
+        with col_sav2:
+            st.caption(f"Categories: {', '.join(savings_categories[:8])}{'...' if len(savings_categories) > 8 else ''}")
+            st.info(f"General Savings automatically receives the remainder ({savings_target:.1f}%) after all expense envelopes are allocated. This is not manually editable.")
+    
+    # Summary and save
+    expenses_pct = sum(float(e.get('Target %', 0.0)) for e in updated_entries)
+    final_config = _finalize_envelope_config(updated_entries, savings_row)
+    
+    st.markdown("---")
+    col_sum1, col_sum2, col_sum3 = st.columns(3)
+    with col_sum1:
+        if income_estimate > 0:
+            expenses_dollars = (expenses_pct / 100.0) * income_estimate
+            st.metric("Expenses Allocation", f"{expenses_pct:.1f}%", f"${expenses_dollars:,.2f}")
+    with col_sum2:
+        if income_estimate > 0 and savings_row:
+            savings_pct = final_config[-1]['Target %']
+            savings_dollars = (savings_pct / 100.0) * income_estimate
+            st.metric("Savings Allocation", f"{savings_pct:.1f}%", f"${savings_dollars:,.2f}")
+    with col_sum3:
+        total_pct = expenses_pct + (final_config[-1]['Target %'] if final_config else 0.0)
+        if abs(total_pct - 100.0) < 0.01:
+            st.success("✅ 100% Allocated")
+        elif expenses_pct > 100.01:
+            st.error(f"⚠️ Over 100%")
+        else:
+            st.info(f"Total: {total_pct:.1f}%")
+    
+    # Check for unassigned categories after edits
+    final_assigned = set()
+    for entry in updated_entries:
+        cats = [c.strip() for c in entry.get('Categories', '').split(',') if c.strip()]
+        final_assigned.update(cats)
+    if savings_row:
+        savings_cats = [c.strip() for c in savings_row.get('Categories', '').split(',') if c.strip()]
+        final_assigned.update(savings_cats)
+    
+    final_unassigned = [c for c in all_categories if c not in final_assigned]
+    
+    # Single save button - saves both envelope config and budget amounts, then saves to disk
+    if st.button("💾 Save Budget", type="primary", use_container_width=True):
+        if final_unassigned:
+            st.error(f"⚠️ Cannot save: {len(final_unassigned)} category(ies) are not assigned to any envelope: {', '.join(final_unassigned[:10])}{'...' if len(final_unassigned) > 10 else ''}. Please assign all categories to envelopes.")
+        elif income_estimate > 0 and expenses_pct > 100.01:
+            st.error(f"⚠️ Expenses allocation exceeds 100% ({expenses_pct:.1f}%). Please adjust.")
+        else:
+            # Save envelope configuration
+            st.session_state.envelope_groups_config = final_config
+            
+            # Calculate budget amounts from percentages
+            envelope_budget_amounts = {}
+            for entry in updated_entries:
+                envelope_name = entry['Group']
+                target_pct = entry['Target %']
+                if target_pct > 0 and income_estimate > 0:
+                    envelope_budget_amounts[envelope_name] = (target_pct / 100.0) * income_estimate
+            
+            # Expand envelope budgets to category budgets
+            if envelope_budget_amounts:
+                expanded = _expand_group_budgets(envelope_budget_amounts, analytics, groups)
+                st.session_state.budgets = expanded
+                total_budget = sum(expanded.values())
+            else:
+                st.session_state.budgets = {}
+                total_budget = 0.0
+            
+            # Save to disk with the provided budget name
+            if not budget_name or not budget_name.strip():
+                budget_name = "My Budget"
+            
+            try:
+                _save_budget_to_disk(budget_name.strip(), dict(st.session_state.budgets), final_config)
+                st.session_state.selected_budget_name = budget_name.strip()
+                if total_budget > 0:
+                    total_str = _escape_dollar_for_markdown(total_budget)
+                    st.success(f"✅ Saved budget '{budget_name.strip()}'! {len(st.session_state.budgets)} categories budgeted ({total_str} total, {expenses_pct:.1f}% of income)")
+                else:
+                    st.success(f"✅ Saved budget '{budget_name.strip()}' (envelope configuration saved)")
+                st.rerun()
+            except (ValueError, OSError) as e:
+                st.error(f"Failed to save budget: {e}")
+
+
+def _render_envelope_budget_editor(groups: Dict[str, List[str]], targets: Dict[str, float], budgets: Dict[str, float], analytics: Optional[PersonalFinanceAnalytics], income_estimate: float, budget_name: str, saved_budgets: Dict[str, Dict[str, Any]]) -> None:
+    """Render envelope-based budget editor using percentage of income only."""
+    st.markdown("#### Quick Setup: Envelope Groups")
+    st.caption("Set budgets by envelope group as percentage of income. Changes will be distributed to categories within each group.")
+    
+    if income_estimate <= 0:
+        st.warning("⚠️ No income data available. Upload transaction data with income to enable percentage-based budgeting.")
+        return
+    
+    st.info(f"💡 Set budgets as **percentage of income** (${income_estimate:,.2f} monthly). Dollar amounts are calculated automatically.")
+    
+    # Get envelope config to determine which are savings
+    envelope_config = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+    envelope_types = {row.get('Group'): row.get('Type', ENVELOPE_TYPE_EXPENSES) for row in envelope_config}
+    
+    group_budgets = _aggregate_budgets_by_group(budgets, groups)
+    
+    # Separate expenses and savings groups
+    expenses_groups = [g for g in groups.keys() if envelope_types.get(g, ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES]
+    savings_groups = [g for g in groups.keys() if envelope_types.get(g) == ENVELOPE_TYPE_SAVINGS]
+    
+    # Create editor dataframe - only show expenses groups for editing
+    group_df = pd.DataFrame({'Group': expenses_groups})
+    group_df['Recommended %'] = group_df['Group'].map(lambda g: targets.get(g, 0.0) * 100)
+    # Calculate current percentage from existing budgets
+    group_df['Budget (%)'] = group_df.apply(
+        lambda row: (group_budgets.get(row['Group'], 0.0) / income_estimate * 100) if income_estimate > 0 and group_budgets.get(row['Group'], 0.0) > 0 else 0.0,
+        axis=1
+    )
+    group_df['Budget ($)'] = group_df.apply(
+        lambda row: (row['Budget (%)'] / 100.0) * income_estimate if row['Budget (%)'] > 0 else 0.0,
+        axis=1
+    )
+    group_df['Suggested (%)'] = group_df['Group'].map(lambda g: targets.get(g, 0.0) * 100)
+    
+    # Show savings groups separately (read-only)
+    if savings_groups:
+        st.info(f"💾 **Savings Envelopes** ({', '.join(savings_groups)}) are calculated automatically as the remainder after expenses. They are not included in the allocation below.")
+    
+    edited = st.data_editor(
+        group_df,
+        use_container_width=True,
+        hide_index=True,
+        key='budget_editor_groups_percent',
+        column_config={
+            'Budget (%)': st.column_config.NumberColumn(
+                "Budget (%)", 
+                format="%0.2f%%",
+                help="Enter percentage of income for this envelope"
+            ),
+            'Budget ($)': st.column_config.NumberColumn("Budget ($)", format="$%0.2f", disabled=True, help="Calculated from percentage"),
+            'Suggested (%)': st.column_config.NumberColumn("Suggested (%)", format="%0.2f%%", disabled=True),
+            'Recommended %': st.column_config.NumberColumn("Recommended %", format="%0.2f%%", disabled=True),
+        }
+    )
+    
+    # Process edits - use percentage only
+    if st.button("💾 Save Budget", type="primary", key='save_group_budgets', use_container_width=True):
+        group_amounts = {}
+        total_pct = 0.0
+        
+        for _, row in edited.iterrows():
+            group = row['Group']
+            budget_pct = float(row['Budget (%)']) if pd.notna(row['Budget (%)']) else 0.0
+            
+            if budget_pct > 0 and income_estimate > 0:
+                # Convert percentage to dollars
+                budget_dollars = (budget_pct / 100.0) * income_estimate
+                group_amounts[group] = budget_dollars
+                total_pct += budget_pct
+        
+        # Validate total percentage (only expenses count)
+        if total_pct > 100.01:
+            st.error(f"⚠️ Expenses budget exceeds 100% of income ({total_pct:.1f}%). Please adjust. Savings will be calculated as the remainder.")
+        else:
+            # Expand group budgets to category budgets
+            expanded = _expand_group_budgets(group_amounts, analytics, groups)
+            st.session_state.budgets = expanded
+            
+            # Save to disk with the provided budget name
+            if not budget_name or not budget_name.strip():
+                budget_name = "My Budget"
+            
+            envelope_config = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+            try:
+                _save_budget_to_disk(budget_name.strip(), dict(expanded), envelope_config)
+                st.session_state.selected_budget_name = budget_name.strip()
+                savings_pct = max(0.0, 100.0 - total_pct)
+                total_str = _escape_dollar_for_markdown(sum(group_amounts.values()))
+                st.success(f"✅ Saved budget '{budget_name.strip()}'! {len(expanded)} categories ({total_pct:.1f}% of income, {total_str} total). Savings: {savings_pct:.1f}%")
+                st.rerun()
+            except (ValueError, OSError) as e:
+                st.error(f"Failed to save budget: {e}")
+
+
+def _render_detailed_budget_editor(budgets: Dict[str, float], groups: Dict[str, List[str]], targets: Dict[str, float], analytics: Optional[PersonalFinanceAnalytics], income_estimate: float, budget_name: str, saved_budgets: Dict[str, Dict[str, Any]]) -> None:
+    """Render detailed category budget editor using percentage of income only."""
+    st.markdown("#### Detailed Setup: Individual Categories")
+    st.caption("Set budgets for each category individually as percentage of income.")
+    
+    if income_estimate <= 0:
+        st.warning("⚠️ No income data available. Upload transaction data with income to enable percentage-based budgeting.")
+        return
+    
+    income_str = _escape_dollar_for_markdown(income_estimate)
+    st.info(f"💡 Set budgets as percentage of income ({income_str} monthly). Dollar amounts are calculated automatically.")
+    
+    categories = sorted(set(budgets.keys()) | set(_fetch_categories()))
+    if analytics is not None and not analytics.calculate_category_spending().empty:
+        categories = sorted(set(categories) | set(analytics.calculate_category_spending().index.tolist()))
+    
+    if not categories:
+        st.info("No categories available. Import transaction data to see categories.")
+        return
+    
+    editor_df = pd.DataFrame({'Category': categories})
+    editor_df = pd.DataFrame({'Category': categories})
+    editor_df['Group'] = editor_df['Category'].map(lambda c: _infer_group(c, groups))
+    editor_df['Monthly Budget (%)'] = editor_df.apply(
+        lambda row: (budgets.get(row['Category'], 0.0) / income_estimate * 100) if income_estimate > 0 and budgets.get(row['Category'], 0.0) > 0 else 0.0,
+        axis=1
+    )
+    editor_df['Monthly Budget ($)'] = editor_df.apply(
+        lambda row: (row['Monthly Budget (%)'] / 100.0) * income_estimate if row['Monthly Budget (%)'] > 0 else 0.0,
+        axis=1
+    )
+    
+    suggestions = _suggested_amounts(editor_df['Category'], analytics, True, groups, targets)
+    editor_df['Suggested (%)'] = editor_df.apply(
+        lambda row: (suggestions.get(row['Category'], 0.0) / income_estimate * 100) if income_estimate > 0 and suggestions.get(row['Category'], 0.0) > 0 else 0.0,
+        axis=1
+    )
+    editor_df['Suggested ($)'] = editor_df['Category'].map(suggestions).fillna(0.0)
+    editor_df['Use suggestion'] = False
+
+    editor_df['Use suggestion'] = False
+
+    edited = st.data_editor(
+            use_container_width=True,
+        key='budget_editor_detailed_percent',
+            column_config={
+            'Monthly Budget (%)': st.column_config.NumberColumn(
+                "Monthly Budget (%)", 
+                format="%0.2f%%",
+                help="Enter percentage of income for this category"
+            ),
+            'Monthly Budget ($)': st.column_config.NumberColumn("Monthly Budget ($)", format="$%0.2f", disabled=True, help="Calculated from percentage"),
+            'Suggested (%)': st.column_config.NumberColumn("Suggested (%)", format="%0.2f%%", disabled=True),
+                'Suggested ($)': st.column_config.NumberColumn("Suggested ($)", format="$%0.2f", disabled=True),
+            'Use suggestion': st.column_config.CheckboxColumn("Auto", help="Use suggested percentage"),
+            },
+            hide_index=True,
+        )
+
+    if st.button("💾 Save Budget", type="primary", key='save_detailed_budgets', use_container_width=True):
+        updated = {}
+        total_pct = 0.0
+        
+        for row in edited.to_dict('records'):
+            category = row.get('Category')
+            if not category:
+                continue
+            
+            # Handle "Use suggestion" checkbox
+            if row.get('Use suggestion', False):
+                budget_pct = float(row.get('Suggested (%)', 0.0)) if pd.notna(row.get('Suggested (%)')) else 0.0
+            else:
+                budget_pct = float(row.get('Monthly Budget (%)', 0.0)) if pd.notna(row.get('Monthly Budget (%)')) else 0.0
+            
+            if budget_pct > 0 and income_estimate > 0:
+                # Convert percentage to dollars
+                amount = (budget_pct / 100.0) * income_estimate
+                updated[category] = float(amount)
+                total_pct += budget_pct
+        
+        # Validate total percentage
+        if total_pct > 100.01:
+            st.error(f"⚠️ Total budget exceeds 100% of income ({total_pct:.1f}%). Please adjust.")
+        else:
+            st.session_state.budgets = updated
+            
+            # Save to disk with the provided budget name
+            if not budget_name or not budget_name.strip():
+                budget_name = "My Budget"
+            
+            envelope_config = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+            try:
+                _save_budget_to_disk(budget_name.strip(), dict(updated), envelope_config)
+                st.session_state.selected_budget_name = budget_name.strip()
+                total_dollars = sum(updated.values())
+                total_str = _escape_dollar_for_markdown(total_dollars)
+                st.success(f"✅ Saved budget '{budget_name.strip()}'! {len(updated)} categories ({total_pct:.1f}% of income, {total_str} total)")
+                st.rerun()
+            except (ValueError, OSError) as e:
+                st.error(f"Failed to save budget: {e}")
+
+
+def _render_budget_insights(budgets: Dict[str, float], analytics: Optional[PersonalFinanceAnalytics], budget_name: str, allow_empty: bool = False) -> None:
+    if analytics is None or analytics.data.empty:
+        st.info("📊 Load transactions to analyze budgets.")
+        return
+    
+    if not budgets:
+        st.warning("⚠️ **No budget amounts set**")
+        if budget_name:
+            st.info(f"""
+            **Current budget: "{budget_name}"** (saved but empty)
+            
+            To see insights:
+            1. Go to the **🛠 Manage Budgets** tab
+            2. Use the budget editor to set monthly budget amounts for categories
+            3. Click **💾 Save budgets** to save your changes
+            4. Return here to see insights
+            """)
+        else:
+            st.info("""
+            **To get started:**
+            1. Go to the **🛠 Manage Budgets** tab
+            2. Use the budget editor to set monthly budget amounts for categories
+            3. Click **💾 Save budgets** to save your budget
+            4. Return here to see insights
+            """)
+        return
+    data = analytics.data.copy()
+    data['Month'] = data['Transaction Date'].dt.to_period('M')
+    if data.empty or 'Month' not in data:
+        st.info("No data available in the selected window.")
+        return
+
+    # Current month focus using 3-month average income
+    current_month = data['Month'].max()
+    income_estimate = _three_month_avg_income(analytics)
+    envelopes = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+    groups_map = _groups_from_envelopes(envelopes)
+    targets_map = _targets_from_envelopes(envelopes)
+
+    current_expense = analytics._expense_rows(data[data['Month'] == current_month])
+    current_expense['AbsAmount'] = current_expense['Amount'].abs()
+    spend_by_group: Dict[str, float] = {}
+    for _, row in current_expense.iterrows():
+        category = row['Category']
+        amount = float(row['AbsAmount'])
+        group = next((g for g, cats in groups_map.items() if category in cats), next(iter(groups_map.keys()), 'Other')) if groups_map else 'Other'
+        spend_by_group[group] = spend_by_group.get(group, 0.0) + amount
+
+    st.subheader(f"Current month ({current_month}) performance")
+    cols = st.columns(4)
+    current_spend_total = sum(spend_by_group.values())
+    savings_amt = income_estimate - current_spend_total if income_estimate else 0.0
+    utilization = (current_spend_total / income_estimate * 100) if income_estimate else None
+    cols[0].metric("3-mo avg income", f"${income_estimate:,.0f}")
+    cols[1].metric("Current spend", f"${current_spend_total:,.0f}")
+    cols[2].metric("Saved so far", f"${savings_amt:,.0f}", delta=f"{(savings_amt/income_estimate*100):+.1f}%" if income_estimate else None)
+    cols[3].metric("Utilization vs income", f"{utilization:,.1f}%" if utilization is not None else "–")
+
+    st.markdown("#### Envelope utilization vs targets")
+    st.markdown(
+        """
+        <style>
+        .env-label {font-size:0.95rem;font-weight:700;margin-bottom:4px;color:#2563eb;}
+        .env-meta {font-size:0.85rem;color:#1f2937;margin-top:4px;font-style:normal;}
+        .env-badge {display:inline-block;padding:2px 6px;margin:2px 4px 0 0;border-radius:6px;background:#eef2f7;font-style:normal;}
+        .env-badge.over {background:#f4d6d4;color:#5a1a15;}
+        .env-badge.under {background:#d9ead3;color:#1d4d1b;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    env_cols = st.columns(len(targets_map) or 1)
+    for idx, (group, target_pct) in enumerate(targets_map.items()):
+        target_dollars = income_estimate * target_pct
+        actual = spend_by_group.get(group, 0.0)
+        pct_used = (actual / target_dollars * 100) if target_dollars else 0.0
+        bar = min(max(pct_used / 100.0, 0.0), 2.0)  # cap bar at 200%
+        caption = f"Target $ {target_dollars:,.0f} · Actual $ {actual:,.0f} · {pct_used:,.1f}%"
+        variance = actual - target_dollars
+        status_class = 'over' if variance > 0 else 'under'
+        status_emoji = '⚠️ ' if variance > 0 and target_dollars else '✅ '
+        with env_cols[idx % len(env_cols)]:
+            st.markdown(f"<div class='env-label'>{status_emoji}{group}</div>", unsafe_allow_html=True)
+            st.progress(bar, text=caption)
+            meta = (
+                f"<div class='env-meta'>"
+                f"<span class='env-badge'>Target $ {target_dollars:,.0f}</span>"
+                f"<span class='env-badge'>Actual $ {actual:,.0f}</span>"
+                f"<span class='env-badge {status_class}'>Variance {variance:+,.0f}</span>"
+                f"<span class='env-badge {status_class}'>{pct_used:,.1f}% of target</span>"
+                f"</div>"
+            )
+            st.markdown(meta, unsafe_allow_html=True)
+
+    # Performance snapshots for whole range
+    perf_range, months_count = _budget_performance_snapshot(analytics, budgets, current_only=False)
+    st.markdown("### Budget vs Actual (date range)")
+    if not perf_range.empty:
+        _render_perf_table(perf_range)
+        _render_perf_chart(perf_range, title=f"{months_count} mo: Budget vs Actual (total)", use_total=True)
+        _render_variance_focus(perf_range)
+    else:
+        st.caption("No budgets matched to expenses in the current window.")
+
+    # Envelope performance by month (targets vs actuals)
+    st.markdown("### Envelope performance by month")
+    monthly_groups = _monthly_group_targets_actuals(analytics, targets_map, groups_map)
+    if not monthly_groups.empty:
+        def _highlight_status(row):
+            status = row.get('Status')
+            if status == 'Over':
+                return ['background-color: #d99a9a; color: #111; font-weight: 600'] * len(row)
+            if status == 'Under':
+                return ['background-color: #b7d3b0; color: #111; font-weight: 600'] * len(row)
+            return [''] * len(row)
+
+        display_df = monthly_groups.fillna(0)
+        st.dataframe(
+            display_df.style.apply(_highlight_status, axis=1).format({
+                'Target ($)': '${:,.0f}',
+                'Actual ($)': '${:,.0f}',
+                'Target % Income': '{:,.1f}%',
+                'Actual % Income': '{:,.1f}%'
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        recent = monthly_groups[monthly_groups['Month'].isin(monthly_groups['Month'].unique()[-6:])]
+        for group in recent['Group'].unique():
+            sub = recent[recent['Group'] == group]
+            colors = ['#d62728' if act > tgt else '#1f77b4' for act, tgt in zip(sub['Actual ($)'], sub['Target ($)'])]
+            fig_env = go.Figure()
+            fig_env.add_bar(name=f'{group} Actual', x=sub['Month'], y=sub['Actual ($)'], marker_color=colors)
+            fig_env.add_scatter(name=f'{group} Target', x=sub['Month'], y=sub['Target ($)'], mode='lines+markers', line=dict(color='#555'), marker=dict(symbol='diamond'))
+            fig_env.update_layout(title=f'{group}: monthly target vs actual', barmode='group', xaxis_tickangle=-25)
+            st.plotly_chart(fig_env, use_container_width=True)
+    else:
+        st.caption("No spending data matched to envelope groups in this window.")
+
+    # Spend vs income by month (actuals)
+    st.markdown("### Spend vs income by month")
+    monthly = _monthly_income_vs_spend(analytics)
+    if not monthly.empty:
+        monthly['Saved % of Income'] = monthly['Saved % of Income'].fillna(0.0)
+        st.dataframe(
+            monthly.style.format({'Income': '${:,.0f}', 'Spend': '${:,.0f}', 'Saved': '${:,.0f}', 'Saved % of Income': '{:,.1f}%'}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        fig_m = go.Figure()
+        fig_m.add_bar(name='Income', x=monthly['Month'], y=monthly['Income'], marker_color='#1f77b4')
+        fig_m.add_bar(name='Spend', x=monthly['Month'], y=monthly['Spend'], marker_color='#ff7f0e')
+        fig_m.add_bar(name='Saved', x=monthly['Month'], y=monthly['Saved'], marker_color='#2ca02c')
+        fig_m.update_layout(barmode='group', title='Monthly income, spend, and savings', xaxis_tickangle=-25)
+        st.plotly_chart(fig_m, use_container_width=True)
+    else:
+        st.caption("Not enough data to compare income and spend by month.")
+
+    # Category share of income
+    st.markdown("### Spend as % of income")
+    income_series = _income_series_complete(analytics)
+    percent_df = _category_percent_income(analytics, income_series)
+    if not percent_df.empty:
+        capped = percent_df.copy()
+        vmax = capped['Percent'].quantile(0.9) if not capped['Percent'].empty else None
+        if vmax and vmax > 0:
+            capped['Percent'] = capped['Percent'].clip(upper=vmax)
+        heatmap = capped.pivot(index='Month', columns='Category', values='Percent').fillna(0)
+        fig = px.imshow(
+            heatmap,
+            aspect='auto',
+            color_continuous_scale='RdPu',
+            title='Expense categories as % of monthly income (clipped)',
+            labels=dict(color='% income'),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("Need at least one month of income and expense data to compute percentages.")
+
+    # Trendline (omit if no budget signal)
+    if budgets and sum(budgets.values()) > 0:
+        trend_df = _budget_trend_dataframe(analytics, budgets)
+        nonzero = trend_df[trend_df['Amount'] > 0] if not trend_df.empty else pd.DataFrame()
+        if not nonzero.empty:
+            st.markdown("### Trendline")
+            fig_trend = px.line(nonzero, x='Month', y='Amount', color='Metric', markers=True, title='Budget vs Actual trend')
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+
+def _budget_trend_dataframe(analytics: PersonalFinanceAnalytics, budgets: Dict[str, float]) -> pd.DataFrame:
+    history = []
+    data = analytics.data.copy()
+    if data.empty:
+        return pd.DataFrame()
+    data['Month'] = data['Transaction Date'].dt.to_period('M')
+    expense = data[data['Amount'] < 0].copy()
+    expense['Amount'] = expense['Amount'].abs()
+    grouped = expense.groupby('Month')['Amount'].sum().reset_index()
+    grouped['Month'] = grouped['Month'].astype(str)
+    history.append(pd.DataFrame({'Month': grouped['Month'], 'Amount': grouped['Amount'], 'Metric': 'Actual'}))
+    monthly_budget = sum(budgets.values())
+    budget_line = pd.DataFrame({'Month': grouped['Month'], 'Amount': monthly_budget, 'Metric': 'Budget'})
+    history.append(budget_line)
+    return pd.concat(history, ignore_index=True)
+
+
+def _monthly_income_vs_spend(analytics: PersonalFinanceAnalytics) -> pd.DataFrame:
+    data = analytics.data.copy()
+    if data.empty:
+        return pd.DataFrame()
+    data['Month'] = data['Transaction Date'].dt.to_period('M')
+    income = data[data['Amount'] > 0].groupby('Month')['Amount'].sum()
+    spend = data[data['Amount'] < 0]['Amount'].abs().groupby(data['Transaction Date'].dt.to_period('M')).sum()
+    months = sorted(set(income.index) | set(spend.index))
+    rows = []
+    for m in months:
+        inc = float(income.get(m, 0.0))
+        sp = float(spend.get(m, 0.0))
+        saved = inc - sp
+        rows.append({
+            'Month': str(m),
+            'Income': inc,
+            'Spend': sp,
+            'Saved': saved,
+            'Saved % of Income': (saved / inc * 100) if inc else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _monthly_group_targets_actuals(analytics: PersonalFinanceAnalytics, targets_map: Dict[str, float], groups_map: Dict[str, List[str]]) -> pd.DataFrame:
+    data = analytics.data.copy()
+    if data.empty:
+        return pd.DataFrame()
+    data['Month'] = data['Transaction Date'].dt.to_period('M')
+    income_by_month = data[data['Amount'] > 0].groupby('Month')['Amount'].sum()
+    expense = analytics._expense_rows(data)
+    expense['AbsAmount'] = expense['Amount'].abs()
+    expense['Month'] = expense['Transaction Date'].dt.to_period('M')
+    actual_by_pair: Dict[tuple, float] = {}
+    for _, row in expense.iterrows():
+        category = row['Category']
+        group = next((g for g, cats in groups_map.items() if category in cats), next(iter(groups_map.keys()), 'Other')) if groups_map else 'Other'
+        key = (row['Month'], group)
+        actual_by_pair[key] = actual_by_pair.get(key, 0.0) + float(row['AbsAmount'])
+    months = sorted(set(income_by_month.index) | {pair[0] for pair in actual_by_pair.keys()})
+    rows = []
+    for month in months:
+        income = float(income_by_month.get(month, 0.0))
+        for group, target_pct in targets_map.items():
+            target_dollars = income * target_pct
+            actual = actual_by_pair.get((month, group), 0.0)
+            status = 'No Income' if income == 0 else ('Over' if target_dollars and actual > target_dollars else 'Under')
+            rows.append({
+                'Month': str(month),
+                'Group': group,
+                'Target ($)': target_dollars,
+                'Actual ($)': actual,
+                'Target % Income': target_pct * 100,
+                'Actual % Income': (actual / income * 100) if income else 0.0,
+                'Status': status,
+                'Variance ($)': target_dollars - actual,
+            })
+    return pd.DataFrame(rows)
+
+
+def _fetch_categories() -> List[str]:
+    records = db.fetch_distinct_categories()
+    return [c for c in records if c]
+
+
+def _ensure_savings_entry(config: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Ensure savings entry exists with proper Type field. General Savings has no categories."""
+    config_copy = [dict(row) for row in config]
+    
+    # Get all categories and find which are assigned
+    all_categories = set(_fetch_categories())
+    assigned_categories = set()
+    for row in config_copy:
+        if row.get('Group') != SAVINGS_GROUP_NAME:  # Don't count savings categories
+            cats = [c.strip() for c in row.get('Categories', '').split(',') if c.strip()]
+            assigned_categories.update(cats)
+    
+    unassigned = all_categories - assigned_categories
+    
+    found = False
+    for row in config_copy:
+        if row.get('Group') == SAVINGS_GROUP_NAME:
+            # Ensure Type is set to savings and categories are empty
+            row['Type'] = ENVELOPE_TYPE_SAVINGS
+            row['Categories'] = ''  # General Savings has no categories
+            found = True
+            break
+    
+    if not found:
+        # Calculate remainder for savings
+        expenses_total = sum(
+            float(row.get('Target %', 0.0)) 
+            for row in config_copy 
+            if row.get('Type', ENVELOPE_TYPE_EXPENSES) == ENVELOPE_TYPE_EXPENSES
+        )
+        savings_target = round(max(0.0, 100.0 - expenses_total), 2)
+        config_copy.append({
+            'Group': SAVINGS_GROUP_NAME,
+            'Type': ENVELOPE_TYPE_SAVINGS,
+            'Target %': savings_target,
+            'Categories': '',  # General Savings has no categories
+        })
+    
+    # Distribute any unassigned categories to Needs or Wants
+    if unassigned:
+        needs_env = next((e for e in config_copy if e.get('Group') == 'Essentials (Needs)'), None)
+        wants_env = next((e for e in config_copy if e.get('Group') == 'Lifestyle (Wants)'), None)
+        
+        if needs_env and wants_env:
+            needs_cats = [c.strip() for c in needs_env.get('Categories', '').split(',') if c.strip()]
+            wants_cats = [c.strip() for c in wants_env.get('Categories', '').split(',') if c.strip()]
+            
+            for cat in sorted(unassigned):
+                target = _categorize_expense(cat)
+                if target == 'Essentials (Needs)':
+                    needs_cats.append(cat)
+                else:
+                    wants_cats.append(cat)
+            
+            needs_env['Categories'] = ', '.join(sorted(set(needs_cats)))
+            wants_env['Categories'] = ', '.join(sorted(set(wants_cats)))
+    
+    return config_copy
+
+
+def _finalize_envelope_config(entries: List[Dict[str, str]], savings_template: Dict[str, str]) -> List[Dict[str, str]]:
+    """Finalize envelope configuration, calculating savings as remainder."""
+    normalized = []
+    # Only count expenses envelopes for total allocation
+    expenses_total = 0.0
+    for row in entries:
+        row_copy = dict(row)
+        envelope_type = row_copy.get('Type', ENVELOPE_TYPE_EXPENSES)
+        
+        # Only expenses envelopes contribute to allocation
+        # Only expenses envelopes contribute to allocation
+        if envelope_type == ENVELOPE_TYPE_EXPENSES:
+            row_copy['Target %'] = max(0.0, min(100.0, float(row_copy.get('Target %', 0.0))))
+            expenses_total += row_copy['Target %']
+        else:
+            # Savings envelopes don't have editable Target %
+            row_copy['Target %'] = 0.0
+        # Ensure Type field is present
+        if 'Type' not in row_copy:
+            row_copy['Type'] = ENVELOPE_TYPE_EXPENSES
+        
+        normalized.append(row_copy)
+    
+    # Calculate savings as remainder (only count expenses)
+    expenses_total = min(expenses_total, 100.0)
+    savings_target = round(max(0.0, 100.0 - expenses_total), 2)
+    
+    # Add or update savings entry
+    savings_entry = {
+        'Group': SAVINGS_GROUP_NAME,
+        'Type': ENVELOPE_TYPE_SAVINGS,
+        'Target %': savings_target,  # Auto-calculated, not editable
+        'Categories': savings_template.get('Categories', '')  # General Savings has no categories
+    }
+    
+    # Remove any existing savings entry and add the new one
+    normalized = [e for e in normalized if e.get('Group') != SAVINGS_GROUP_NAME]
+    return normalized + [savings_entry]
+
+
+def _groups_from_envelopes(config: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    groups: Dict[str, List[str]] = {}
+    for row in _ensure_savings_entry(config):
+        name = row.get('Group') or 'Lifestyle (Wants)'
+        cats = [c.strip() for c in row.get('Categories', '').split(',') if c.strip()]
+        groups[name] = cats
+    return groups
+
+
+def _targets_from_envelopes(config: List[Dict[str, Any]]) -> Dict[str, float]:
+    targets: Dict[str, float] = {}
+    for row in _ensure_savings_entry(config):
+        name = row.get('Group') or 'Lifestyle (Wants)'
+        targets[name] = float(row.get('Target %', 0.0)) / 100.0
+    return targets
+
+
+def _current_envelope_groups() -> Dict[str, List[str]]:
+    config = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+    return _groups_from_envelopes(config)
+
+
+def _current_target_map() -> Dict[str, float]:
+    config = st.session_state.get('envelope_groups_config', DEFAULT_ENVELOPES)
+    return _targets_from_envelopes(config)
+
+
+def _category_percent_income(analytics: PersonalFinanceAnalytics, income_series: pd.Series) -> pd.DataFrame:
+    data = analytics.data.copy()
+    if data.empty or income_series.empty:
+        return pd.DataFrame()
+    data['Month'] = data['Transaction Date'].dt.to_period('M').astype(str)
+    months = income_series.index.tolist()
+    income_df = income_series.rename('Income').reset_index().rename(columns={'index': 'Month'})
+    expense = data[(data['Amount'] < 0) & (data['Month'].isin(months))].copy()
+    expense['AbsAmount'] = expense['Amount'].abs()
+    cat_month = expense.groupby(['Month', 'Category'])['AbsAmount'].sum().reset_index()
+
+    totals = cat_month.groupby('Month')['AbsAmount'].sum()
+    savings = income_df.copy()
+    savings['AbsAmount'] = savings['Income'] - savings['Month'].map(totals).fillna(0)
+    savings['AbsAmount'] = savings['AbsAmount'].clip(lower=0)
+    savings['Category'] = 'Savings'
+    cat_month = pd.concat([cat_month, savings[['Month', 'Category', 'AbsAmount']]], ignore_index=True)
+
+    merged = cat_month.merge(income_df, on='Month', how='inner')
+    merged = merged[merged['Income'] > 0]
+    merged['Percent'] = (merged['AbsAmount'] / merged['Income']) * 100
+    merged = merged[merged['Category'].str.lower() != 'income']
+    merged['Month'] = pd.Categorical(merged['Month'], categories=months, ordered=True)
+    return merged.sort_values(['Month', 'Category'])
+
+
+def _percent_income_summary(df: pd.DataFrame, income_lookup: pd.Series) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=['Category', 'Amount', 'Percent'])
+    months_used = df['Month'].unique()
+    monthly_income = income_lookup[income_lookup.index.isin(months_used)]
+    if monthly_income.empty:
+        return pd.DataFrame(columns=['Category', 'Amount', 'Percent'])
+    income_avg = monthly_income.mean()
+    if income_avg <= 0:
+        return pd.DataFrame(columns=['Category', 'Amount', 'Percent'])
+    amount_by_category = df.groupby('Category')['AbsAmount'].mean().sort_values(ascending=False)
+    summary = amount_by_category.reset_index().rename(columns={'AbsAmount': 'Amount'})
+    spending_sum = summary['Amount'].sum()
+    savings_amount = max(income_avg - spending_sum, 0.0)
+    if 'Savings' not in summary['Category'].values or savings_amount > 0:
+        summary = pd.concat([
+            summary,
+            pd.DataFrame({'Category': ['Savings'], 'Amount': [savings_amount]})
+        ], ignore_index=True)
+    summary['Percent'] = (summary['Amount'] / income_avg) * 100
+    summary['Percent'] = summary['Percent'].round(1)
+    summary['Amount'] = summary['Amount'].round(2)
+    total_percent = summary['Percent'].sum()
+    if abs(total_percent - 100.0) > 0.1:
+        diff = 100 - total_percent
+        idx = summary['Category'] == 'Savings'
+        if idx.any():
+            summary.loc[idx, 'Percent'] += diff
+    return summary
+
+
+def _suggested_amounts(categories: pd.Series, analytics: Optional[PersonalFinanceAnalytics], detailed: bool, groups_map: Dict[str, List[str]], target_map: Dict[str, float]) -> Dict[str, float]:
+    suggestions: Dict[str, float] = {}
+    if analytics is None or categories.empty:
+        return suggestions
+    income = _weighted_income_estimate(analytics)
+    if income <= 0:
+        return suggestions
+    spending = analytics.calculate_category_spending()
+    category_totals = spending['Total_Spent'] if not spending.empty else pd.Series(dtype=float)
+    grouped_spend = category_totals.groupby(category_totals.index.map(lambda c: _infer_group(c, groups_map))).sum() if not category_totals.empty else pd.Series(dtype=float)
+    for category in categories:
+        if pd.isna(category):
+            continue
+        group = _infer_group(category, groups_map)
+        group_target = income * target_map.get(group, 0.3)
+        if detailed and not category_totals.empty and category in category_totals:
+            group_spend = grouped_spend.get(group, group_target)
+            share = (category_totals.get(category) / group_spend) if group_spend else 1 / max(1, len(groups_map.get(group, [])))
+            suggestions[category] = float(group_target * share)
+        else:
+            suggestions[category] = float(group_target / max(1, len(groups_map.get(group, []))))
+    return suggestions
+
+
+def _suggested_group_amounts(analytics: Optional[PersonalFinanceAnalytics], target_map: Dict[str, float]) -> Dict[str, float]:
+    if analytics is None:
+        return {group: 0.0 for group in target_map}
+    income = _weighted_income_estimate(analytics)
+    return {group: income * pct for group, pct in target_map.items()}
+
+
+def _weighted_income_estimate(analytics: PersonalFinanceAnalytics) -> float:
+    data = analytics.data.copy()
+    if data.empty:
+        return 0.0
+    data['Month'] = data['Transaction Date'].dt.to_period('M')
+    pos = data[data['Amount'] > 0].copy()
+    if pos.empty:
+        return 0.0
+    current_month = pd.Period(pd.Timestamp.utcnow().date(), freq='M')
+    pos = pos[pos['Month'] < current_month]
+    monthly = pos.groupby('Month')['Amount'].sum().sort_index(ascending=False)
+    weights = [0.8, 0.15, 0.05]
+    applicable = monthly.head(3)
+    if applicable.empty:
+        return float(monthly.mean())
+    applied_weights = weights[:len(applicable)]
+    total_weight = sum(applied_weights)
+    weighted = sum(val * w for val, w in zip(applicable.values, applied_weights)) / total_weight
+    return float(weighted)
+
+
+def _aggregate_budgets_by_group(budgets: Dict[str, float], groups_map: Dict[str, List[str]]) -> Dict[str, float]:
+    grouped: Dict[str, float] = {group: 0.0 for group in groups_map}
+    for category, amount in budgets.items():
+        group = _infer_group(category, groups_map)
+        grouped[group] = grouped.get(group, 0.0) + amount
+    return grouped
+
+
+def _expand_group_budgets(group_amounts: Dict[str, float], analytics: Optional[PersonalFinanceAnalytics], groups: Dict[str, List[str]]) -> Dict[str, float]:
+    expanded: Dict[str, float] = {}
+    spending = analytics.calculate_category_spending() if analytics else pd.DataFrame()
+    category_totals = spending['Total_Spent'] if not spending.empty else pd.Series(dtype=float)
+    grouped_spend = category_totals.groupby(category_totals.index.map(lambda c: _infer_group(c, groups))).sum() if not category_totals.empty else pd.Series(dtype=float)
+    for group, amount in group_amounts.items():
+        categories = groups.get(group, [])
+        if not categories or amount <= 0:
+            continue
+        total_group_spend = grouped_spend.get(group, None) if not grouped_spend.empty else None
+        for category in categories:
+            if total_group_spend and category in category_totals:
+                share = category_totals.get(category) / total_group_spend if total_group_spend else 1 / len(categories)
+            else:
+                share = 1 / len(categories)
+            expanded[category] = expanded.get(category, 0.0) + amount * share
+    return expanded
+
+def _infer_group(category: Optional[str], groups_map: Dict[str, List[str]]) -> str:
+    if not category:
+        return next(iter(groups_map.keys()), 'Lifestyle (Wants)')
+    for group, cats in groups_map.items():
+        if category in cats:
+            return group
+    return next(iter(groups_map.keys()), 'Lifestyle (Wants)')
+
+
+if __name__ == '__main__':
+    main()

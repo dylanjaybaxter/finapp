@@ -69,7 +69,7 @@ framework to ensure the analytical functions behave as expected.
    provided `scripts/run_dashboard.sh` automates this process:
 
    ```bash
-   cd finance_dashboard_pro
+   cd finapp
    bash scripts/run_dashboard.sh
    ```
 
@@ -84,7 +84,7 @@ framework to ensure the analytical functions behave as expected.
 ## Repository layout
 
 ```
-finance_dashboard_pro/
+finapp/
 ├── finance_dashboard/          # Python package with modular code
 │   ├── __init__.py             # Package initialisation
 │   ├── data_processing.py      # Pure functions for reading and analysing data

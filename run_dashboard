@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Standalone executable launcher for the Enhanced Personal Finance Dashboard.
+
+This script can be run directly from the repository root after cloning.
+It will:
+1. Create a virtual environment if needed
+2. Install dependencies
+3. Create necessary data directories
+4. Launch the dashboard
+
+Usage:
+    ./run_dashboard
+    or
+    python3 run_dashboard
+"""
+
+import os
+import sys
+import subprocess
+import venv
+from pathlib import Path
+
+def main():
+    """Main entry point for the dashboard launcher."""
+    # Get project root (directory containing this script)
+    project_root = Path(__file__).parent.resolve()
+    os.chdir(project_root)
+    
+    venv_path = project_root / ".venv"
+    python_exe = None
+    
+    # Check if virtual environment exists
+    if venv_path.exists():
+        # Use venv Python if available
+        if sys.platform == "win32":
+            python_exe = venv_path / "Scripts" / "python.exe"
+        else:
+            python_exe = venv_path / "bin" / "python"
+        
+        if not python_exe.exists():
+            # Venv exists but Python not found, recreate it
+            print("⚠️  Virtual environment found but Python executable missing. Recreating...")
+            venv_path = None
+    
+    # Create virtual environment if needed
+    if not venv_path or not venv_path.exists():
+        print("📦 Creating virtual environment in .venv...")
+        venv.create(venv_path, with_pip=True)
+        
+        if sys.platform == "win32":
+            python_exe = venv_path / "Scripts" / "python.exe"
+        else:
+            python_exe = venv_path / "bin" / "python"
+    
+    # Ensure Python executable exists
+    if not python_exe or not python_exe.exists():
+        print("❌ Error: Could not find Python executable in virtual environment")
+        sys.exit(1)
+    
+    python_exe = str(python_exe)
+    
+    # Upgrade pip
+    print("📥 Upgrading pip...")
+    subprocess.run([python_exe, "-m", "pip", "install", "--upgrade", "pip", "--quiet"], 
+                   check=False)
+    
+    # Install dependencies
+    requirements_file = project_root / "requirements.txt"
+    if requirements_file.exists():
+        print("📥 Installing dependencies from requirements.txt...")
+        subprocess.run([python_exe, "-m", "pip", "install", "-r", str(requirements_file), "--quiet"],
+                       check=False)
+    else:
+        print("⚠️  Warning: requirements.txt not found. Some dependencies may be missing.")
+    
+    # Create data directories
+    print("📁 Creating data directories...")
+    try:
+        # Try to use config module if available
+        sys.path.insert(0, str(project_root))
+        try:
+            from finance_dashboard.config import ensure_data_directories
+            ensure_data_directories()
+        except ImportError:
+            # Fallback: create directories manually
+            data_dirs = [
+                project_root / "data" / "raw",
+                project_root / "data" / "budgets",
+                project_root / "data" / "goals",
+                project_root / "data" / "reports",
+            ]
+            for dir_path in data_dirs:
+                dir_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️  Warning: Could not create data directories: {e}")
+    
+    # Launch dashboard
+    print("\n" + "=" * 50)
+    print("🚀 Starting Enhanced Personal Finance Dashboard...")
+    print("=" * 50)
+    print("🌐 Dashboard will be available at: http://localhost:8501")
+    print("📱 Mobile-optimized interface included")
+    print("💰 Features: Budgeting, Goal Tracking, Spending Analysis, Financial Insights")
+    print("\nPress Ctrl+C to stop the dashboard\n")
+    
+    # Run Streamlit using module approach (from project root)
+    # This matches the behavior of run_enhanced_dashboard_module.sh
+    finance_dashboard_dir = project_root / "finance_dashboard"
+    if not finance_dashboard_dir.exists():
+        print("❌ Error: finance_dashboard directory not found")
+        sys.exit(1)
+    
+    # Run Streamlit from project root using module path
+    try:
+        subprocess.run([
+            python_exe, "-m", "streamlit", "run", 
+            str(finance_dashboard_dir / "enhanced_dashboard.py")
+        ])
+    except KeyboardInterrupt:
+        print("\n\n👋 Dashboard stopped by user")
+    except Exception as e:
+        print(f"\n❌ Error running dashboard: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+

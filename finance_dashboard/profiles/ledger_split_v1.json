@@ -1,0 +1,87 @@
+{
+  "name": "ledger_split_v1",
+  "description": "Ledger export with separate Debit/Credit columns and running balance.",
+  "match": {
+    "filename_patterns": ["transactions_"],
+    "header_contains": [
+      "Date",
+      "Description",
+      "Debit",
+      "Credit"
+    ]
+  },
+  "requirements": {
+    "required_normalized_fields": [
+      "Transaction Date",
+      "Description",
+      "Amount"
+    ]
+  },
+  "fields": {
+    "column_mappings": {
+      "Transaction Date": ["Date"],
+      "Description": ["Description"],
+      "Category": ["Category"],
+      "Memo": ["Memo"],
+      "Type": ["Type"],
+      "Debit": ["Debit"],
+      "Credit": ["Credit"],
+      "Balance": ["Balance"],
+      "Sub Category": ["Sub Category"],
+      "Check Number": ["Check No."]
+    },
+    "category_mappings": {
+      "Type": {
+        "POS": "Expense",
+        "ATM": "Expense",
+        "FEE": "Expense",
+        "DIRECTDEP": "Income",
+        "ACH": "Transfer"
+      }
+    },
+    "category_groups": {
+      "Category": {
+        "Dining": ["DINING", "RESTAURANTS"],
+        "Groceries": ["GROCERIES", "SUPERMARKETS"],
+        "Transportation": ["TRANSPORTATION", "AUTO", "GAS"],
+        "Utilities": ["UTILITIES", "ELECTRIC", "CABLE", "INTERNET"],
+        "Housing": ["HOUSING", "MORTGAGE", "RENT"],
+        "Entertainment": ["ENTERTAINMENT", "MOVIES", "GAMING"],
+        "Health": ["HEALTH", "MEDICAL", "PHARMACY"],
+        "Travel": ["TRAVEL", "AIRFARE", "HOTEL"],
+        "Shopping": ["SHOPPING", "RETAIL"],
+        "Fees": ["FEE", "SERVICE CHARGE"],
+        "Income": ["INCOME", "PAYROLL", "SALARY", "BONUS"],
+        "Transfers": ["TRANSFER", "ACH"],
+        "Other": ["OTHER", "MISCELLANEOUS", "UNCATEGORIZED"]
+      }
+    },
+    "description_keywords": {
+      "Dining": ["CAFE", "COFFEE", "TACO", "PIZZA", "BURGER", "GRILL", "RESTAURANT", "BAR ", "DINER"],
+      "Groceries": ["GROCERY", "SAFEWAY", "WHOLE FOODS", "TRADER JOE", "MARKET"],
+      "Transportation": ["UBER", "LYFT", "TAXI", "SHELL", "EXXON", "CHEVRON", "PARKING", "METRO"],
+      "Utilities": ["COMCAST", "PG&E", "AT&T", "VERIZON", "T-MOBILE", "UTILITY"],
+      "Travel": ["AIRLINE", "AIRWAYS", "MARRIOTT", "HILTON", "HOTEL", "AIRBNB", "CAR RENTAL"],
+      "Housing": ["RENT", "MORTGAGE", "APARTMENT", "PROPERTY MGMT"],
+      "Health": ["PHARMACY", "CVS", "WALGREENS", "CLINIC", "MEDICAL", "HOSPITAL"],
+      "Entertainment": ["NETFLIX", "SPOTIFY", "HULU", "DISNEY", "THEATER", "GAMING"],
+      "Shopping": ["AMAZON", "TARGET", "WALMART", "BEST BUY", "APPLE", "SHOP"],
+      "Fees": ["FEE", "SERVICE CHARGE", "MAINTENANCE"],
+      "Income": ["PAYROLL", "SALARY", "DEPOSIT"],
+      "Transfers": ["TRANSFER", "ZELLE", "VENMO", "PAYPAL", "XFER"],
+      "Other": ["MISC", "UNCATEGORIZED", "ADJUSTMENT"]
+    }
+  },
+  "transformations": {
+    "Amount": {
+      "type": "debit_credit",
+      "debit_fields": ["Debit"],
+      "credit_fields": ["Credit"]
+    },
+    "Memo": {
+      "type": "append_fields",
+      "fields": ["Sub Category", "Check No."],
+      "separator": " | "
+    }
+  }
+}
