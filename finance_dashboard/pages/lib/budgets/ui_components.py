@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -1521,6 +1522,88 @@ def render_budget_insights(
                     use_container_width=True,
                     hide_index=True
                 )
+                
+                # Month-to-Month Variance Heatmap
+                st.markdown("#### 📊 Monthly Variance: Over/Under Budget")
+                st.caption("Visualization showing how much each envelope was over (red) or under (green) budget each month")
+                
+                # Prepare data for heatmap
+                variance_data = recent.copy()
+                variance_data['Variance ($)'] = variance_data['Target ($)'] - variance_data['Actual ($)']
+                # Positive variance = under budget (good), Negative variance = over budget (bad)
+                
+                # Create pivot table for heatmap
+                variance_pivot = variance_data.pivot_table(
+                    index='Group',
+                    columns='Month',
+                    values='Variance ($)',
+                    aggfunc='first'
+                ).fillna(0)
+                
+                # Prepare data
+                groups = variance_pivot.index.tolist()
+                months = [str(m) for m in variance_pivot.columns]
+                variance_values = variance_pivot.values
+                
+                # Create custom colorscale: green for positive (under budget), red for negative (over budget)
+                # Normalize values for better color distribution
+                max_abs = np.abs(variance_values).max() if variance_values.size > 0 else 1
+                if max_abs == 0:
+                    max_abs = 1
+                
+                # Create text annotations with dollar amounts
+                text_annotations = []
+                for i, group in enumerate(groups):
+                    row = []
+                    for j, month in enumerate(months):
+                        value = variance_values[i, j]
+                        if abs(value) < 0.01:
+                            row.append("$0")
+                        else:
+                            sign = "+" if value >= 0 else ""
+                            row.append(f"{sign}${value:,.0f}")
+                    text_annotations.append(row)
+                
+                # Create heatmap
+                fig_variance = go.Figure(data=go.Heatmap(
+                    z=variance_values,
+                    x=months,
+                    y=groups,
+                    colorscale=[
+                        [0, '#dc2626'],      # Red for over budget (negative values)
+                        [0.5, '#fef3c7'],   # Yellow for at budget (zero)
+                        [1, '#10b981']      # Green for under budget (positive values)
+                    ],
+                    zmid=0,  # Center the colorscale at zero
+                    text=text_annotations,
+                    texttemplate='%{text}',
+                    textfont={"size": 10},
+                    colorbar=dict(
+                        title=dict(text="Variance ($)", side="right"),
+                        tickformat="$,.0f"
+                    ),
+                    hovertemplate='<b>%{y}</b><br>%{x}<br>Variance: $%{z:,.2f}<extra></extra>'
+                ))
+                
+                fig_variance.update_layout(
+                    title='Monthly Envelope Variance: Target vs Actual Spending',
+                    xaxis_title='Month',
+                    yaxis_title='Envelope',
+                    height=max(400, len(groups) * 50),
+                    xaxis_tickangle=-45
+                )
+                
+                st.plotly_chart(fig_variance, use_container_width=True)
+                
+                # Add explanation
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown("🟢 **Green**: Under budget (spent less than target)")
+                with col2:
+                    st.markdown("🟡 **Yellow**: At budget (spent close to target)")
+                with col3:
+                    st.markdown("🔴 **Red**: Over budget (spent more than target)")
+                
             else:
                 st.info("No envelope trend data available.")
         else:
